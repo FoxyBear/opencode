@@ -146,7 +146,7 @@ export namespace Session {
         compacting: z.number().optional(),
         archived: z.number().optional(),
       }),
-      permission: Permission.Ruleset.optional(),
+      permission: Permission.Ruleset.zod.optional(),
       revert: z
         .object({
           messageID: MessageID.zod,
@@ -710,7 +710,7 @@ export namespace Session {
     runPromise((svc) => svc.setArchived(input)),
   )
 
-  export const setPermission = fn(z.object({ sessionID: SessionID.zod, permission: Permission.Ruleset }), (input) =>
+  export const setPermission = fn(z.object({ sessionID: SessionID.zod, permission: Permission.Ruleset.zod }), (input) =>
     runPromise((svc) => svc.setPermission(input)),
   )
 

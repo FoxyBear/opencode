@@ -2,7 +2,8 @@ import { BusEvent } from "@/bus/bus-event"
 import { InstanceState } from "@/effect/instance-state"
 import { AppFileSystem } from "@/filesystem"
 import { Git } from "@/git"
-import { Effect, Layer, Context } from "effect"
+import { zod } from "@/util/effect-zod"
+import { Effect, Layer, Context, Schema } from "effect"
 import { formatPatch, structuredPatch } from "diff"
 import fuzzysort from "fuzzysort"
 import ignore from "ignore"
@@ -15,62 +16,56 @@ import { Protected } from "./protected"
 import { Ripgrep } from "./ripgrep"
 
 export namespace File {
-  export const Info = z
-    .object({
-      path: z.string(),
-      added: z.number().int(),
-      removed: z.number().int(),
-      status: z.enum(["added", "deleted", "modified"]),
-    })
-    .meta({
-      ref: "File",
-    })
+  export class Info extends Schema.Class<Info>("File")({
+    path: Schema.String,
+    added: Schema.Number,
+    removed: Schema.Number,
+    status: Schema.Union([Schema.Literal("added"), Schema.Literal("deleted"), Schema.Literal("modified")]),
+  }) {
+    static readonly zod = zod(this)
+  }
 
-  export type Info = z.infer<typeof Info>
+  export class Node extends Schema.Class<Node>("FileNode")({
+    name: Schema.String,
+    path: Schema.String,
+    absolute: Schema.String,
+    type: Schema.Union([Schema.Literal("file"), Schema.Literal("directory")]),
+    ignored: Schema.Boolean,
+  }) {
+    static readonly zod = zod(this)
+  }
 
-  export const Node = z
-    .object({
-      name: z.string(),
-      path: z.string(),
-      absolute: z.string(),
-      type: z.enum(["file", "directory"]),
-      ignored: z.boolean(),
-    })
-    .meta({
-      ref: "FileNode",
-    })
-  export type Node = z.infer<typeof Node>
+  export class Hunk extends Schema.Class<Hunk>("FileContentHunk")({
+    oldStart: Schema.Number,
+    oldLines: Schema.Number,
+    newStart: Schema.Number,
+    newLines: Schema.Number,
+    lines: Schema.Array(Schema.String),
+  }) {
+    static readonly zod = zod(this)
+  }
 
-  export const Content = z
-    .object({
-      type: z.enum(["text", "binary"]),
-      content: z.string(),
-      diff: z.string().optional(),
-      patch: z
-        .object({
-          oldFileName: z.string(),
-          newFileName: z.string(),
-          oldHeader: z.string().optional(),
-          newHeader: z.string().optional(),
-          hunks: z.array(
-            z.object({
-              oldStart: z.number(),
-              oldLines: z.number(),
-              newStart: z.number(),
-              newLines: z.number(),
-              lines: z.array(z.string()),
-            }),
-          ),
-          index: z.string().optional(),
-        })
-        .optional(),
-      encoding: z.literal("base64").optional(),
-      mimeType: z.string().optional(),
-    })
-    .meta({
-      ref: "FileContent",
-    })
-  export type Content = z.infer<typeof Content>
+  export class Patch extends Schema.Class<Patch>("FileContentPatch")({
+    oldFileName: Schema.String,
+    newFileName: Schema.String,
+    oldHeader: Schema.optional(Schema.String),
+    newHeader: Schema.optional(Schema.String),
+    hunks: Schema.Array(Hunk),
+    index: Schema.optional(Schema.String),
+  }) {
+    static readonly zod = zod(this)
+  }
+
+  export class Content extends Schema.Class<Content>("FileContent")({
+    type: Schema.Union([Schema.Literal("text"), Schema.Literal("binary")]),
+    content: Schema.String,
+    diff: Schema.optional(Schema.String),
+    patch: Schema.optional(Patch),
+    encoding: Schema.optional(Schema.Literal("base64")),
+    mimeType: Schema.optional(Schema.String),
+  }) {
+    static readonly zod = zod(this)
+  }
 
   export const Event = {
     Edited: BusEvent.define(

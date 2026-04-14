@@ -2,70 +2,75 @@ import type { AuthOAuthResult, Hooks } from "@opencode-ai/plugin"
 import { NamedError } from "@opencode-ai/util/error"
 import { Auth } from "@/auth"
 import { InstanceState } from "@/effect/instance-state"
+import { zod } from "@/util/effect-zod"
+import { withStatics } from "@/util/schema"
 import { Plugin } from "../plugin"
 import { ProviderID } from "./schema"
-import { Array as Arr, Effect, Layer, Record, Result, Context } from "effect"
+import { Array as Arr, Effect, Layer, Record, Result, Context, Schema } from "effect"
 import z from "zod"
 
 export namespace ProviderAuth {
-  export const Method = z
-    .object({
-      type: z.union([z.literal("oauth"), z.literal("api")]),
-      label: z.string(),
-      prompts: z
-        .array(
-          z.union([
-            z.object({
-              type: z.literal("text"),
-              key: z.string(),
-              message: z.string(),
-              placeholder: z.string().optional(),
-              when: z
-                .object({
-                  key: z.string(),
-                  op: z.union([z.literal("eq"), z.literal("neq")]),
-                  value: z.string(),
-                })
-                .optional(),
-            }),
-            z.object({
-              type: z.literal("select"),
-              key: z.string(),
-              message: z.string(),
-              options: z.array(
-                z.object({
-                  label: z.string(),
-                  value: z.string(),
-                  hint: z.string().optional(),
-                }),
-              ),
-              when: z
-                .object({
-                  key: z.string(),
-                  op: z.union([z.literal("eq"), z.literal("neq")]),
-                  value: z.string(),
-                })
-                .optional(),
-            }),
-          ]),
-        )
-        .optional(),
-    })
-    .meta({
-      ref: "ProviderAuthMethod",
-    })
-  export type Method = z.infer<typeof Method>
+  export class When extends Schema.Class<When>("ProviderAuthWhen")({
+    key: Schema.String,
+    op: Schema.Union([Schema.Literal("eq"), Schema.Literal("neq")]),
+    value: Schema.String,
+  }) {
+    static readonly zod = zod(this)
+  }
 
-  export const Authorization = z
-    .object({
-      url: z.string(),
-      method: z.union([z.literal("auto"), z.literal("code")]),
-      instructions: z.string(),
-    })
-    .meta({
-      ref: "ProviderAuthAuthorization",
-    })
-  export type Authorization = z.infer<typeof Authorization>
+  export class TextPrompt extends Schema.Class<TextPrompt>("ProviderAuthTextPrompt")({
+    type: Schema.Literal("text"),
+    key: Schema.String,
+    message: Schema.String,
+    placeholder: Schema.optional(Schema.String),
+    when: Schema.optional(When),
+  }) {
+    static readonly zod = zod(this)
+  }
+
+  export class SelectOption extends Schema.Class<SelectOption>("ProviderAuthSelectOption")({
+    label: Schema.String,
+    value: Schema.String,
+    hint: Schema.optional(Schema.String),
+  }) {
+    static readonly zod = zod(this)
+  }
+
+  export class SelectPrompt extends Schema.Class<SelectPrompt>("ProviderAuthSelectPrompt")({
+    type: Schema.Literal("select"),
+    key: Schema.String,
+    message: Schema.String,
+    options: Schema.Array(SelectOption),
+    when: Schema.optional(When),
+  }) {
+    static readonly zod = zod(this)
+  }
+
+  export const Prompt = Schema.Union([TextPrompt, SelectPrompt])
+    .annotate({ discriminator: "type", identifier: "ProviderAuthPrompt" })
+    .pipe(withStatics((s) => ({ zod: zod(s) })))
+  export type Prompt = Schema.Schema.Type<typeof Prompt>
+
+  export class Method extends Schema.Class<Method>("ProviderAuthMethod")({
+    type: Schema.Union([Schema.Literal("oauth"), Schema.Literal("api")]),
+    label: Schema.String,
+    prompts: Schema.optional(Schema.Array(Prompt)),
+  }) {
+    static readonly zod = zod(this)
+  }
+
+  export class Authorization extends Schema.Class<Authorization>("ProviderAuthAuthorization")({
+    url: Schema.String,
+    method: Schema.Union([Schema.Literal("auto"), Schema.Literal("code")]),
+    instructions: Schema.String,
+  }) {
+    static readonly zod = zod(this)
+  }
+
+  export const Methods = Schema.Record(Schema.String, Schema.Array(Method))
+    .annotate({ identifier: "ProviderAuthMethods" })
+    .pipe(withStatics((s) => ({ zod: zod(s) })))
+  export type Methods = Schema.Schema.Type<typeof Methods>
 
   export const OauthMissing = NamedError.create("ProviderAuthOauthMissing", z.object({ providerID: ProviderID.zod }))
 

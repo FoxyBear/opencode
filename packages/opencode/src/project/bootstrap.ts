@@ -11,6 +11,7 @@ import { Instance } from "./instance"
 import { Log } from "@/util/log"
 import { FileWatcher } from "@/file/watcher"
 import { ShareNext } from "@/share/share-next"
+import { initHarnessServices } from "@/harness/worker-init"
 import * as Effect from "effect/Effect"
 
 export const InstanceBootstrap = Effect.gen(function* () {
@@ -23,6 +24,7 @@ export const InstanceBootstrap = Effect.gen(function* () {
   yield* FileWatcher.Service.use((svc) => svc.init()).pipe(Effect.forkDetach)
   yield* Vcs.Service.use((svc) => svc.init()).pipe(Effect.forkDetach)
   yield* Snapshot.Service.use((svc) => svc.init()).pipe(Effect.forkDetach)
+  yield* Effect.promise(() => initHarnessServices()).pipe(Effect.forkDetach)
 
   yield* Bus.Service.use((svc) =>
     svc.subscribeCallback(Command.Event.Executed, async (payload) => {

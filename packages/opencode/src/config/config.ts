@@ -9,6 +9,7 @@ import { Global } from "../global"
 import fsNode from "fs/promises"
 import { NamedError } from "@opencode-ai/util/error"
 import { Flag } from "../flag/flag"
+import { FoxyBearFields } from "./foxybear"
 import { Auth } from "../auth"
 import { Env } from "../env"
 import {
@@ -1054,6 +1055,7 @@ export namespace Config {
         })
         .optional(),
     })
+    .extend(FoxyBearFields)
     .strict()
     .meta({
       ref: "Config",
@@ -1085,7 +1087,7 @@ export namespace Config {
   export class Service extends Context.Service<Service, Interface>()("@opencode/Config") {}
 
   function globalConfigFile() {
-    const candidates = ["opencode.jsonc", "opencode.json", "config.json"].map((file) =>
+    const candidates = ["foxybear.jsonc", "foxybear.json", "opencode.jsonc", "opencode.json", "config.json"].map((file) =>
       path.join(Global.Path.config, file),
     )
     for (const file of candidates) {
@@ -1242,6 +1244,8 @@ export namespace Config {
           mergeDeep(yield* loadFile(path.join(Global.Path.config, "config.json"))),
           mergeDeep(yield* loadFile(path.join(Global.Path.config, "opencode.json"))),
           mergeDeep(yield* loadFile(path.join(Global.Path.config, "opencode.jsonc"))),
+          mergeDeep(yield* loadFile(path.join(Global.Path.config, "foxybear.json"))),
+          mergeDeep(yield* loadFile(path.join(Global.Path.config, "foxybear.jsonc"))),
         )
 
         const legacy = path.join(Global.Path.config, "config")
@@ -1427,7 +1431,7 @@ export namespace Config {
 
         for (const dir of unique(directories)) {
           if (dir.endsWith(".opencode") || dir === Flag.OPENCODE_CONFIG_DIR) {
-            for (const file of ["opencode.json", "opencode.jsonc"]) {
+            for (const file of ["foxybear.json", "foxybear.jsonc", "opencode.json", "opencode.jsonc"]) {
               const source = path.join(dir, file)
               log.debug(`loading config from ${source}`)
               yield* merge(source, yield* loadFile(source))
@@ -1506,7 +1510,7 @@ export namespace Config {
         }
 
         if (existsSync(managedDir)) {
-          for (const file of ["opencode.json", "opencode.jsonc"]) {
+          for (const file of ["foxybear.json", "foxybear.jsonc", "opencode.json", "opencode.jsonc"]) {
             const source = path.join(managedDir, file)
             yield* merge(source, yield* loadFile(source), "global")
           }

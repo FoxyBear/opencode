@@ -1,0 +1,23 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "memory": {
+    "auto_capture": true,
+    "graph_backend": "surreal",
+    "surreal": {
+      "url": "ws://127.0.0.1:8000",
+      "username": "root",
+      "password": "root",
+      "namespace": "foxybear",
+      "database": "memory"
+    },
+    "embedding": {
+      "provider": "deepinfra",
+      "model": "BAAI/bge-base-en-v1.5",
+      "dimensions": 768,
+      "fallback": {
+        "provider": "ollama",
+        "model": "nomic-embed-text"
+      }
+    }
+  }
+}

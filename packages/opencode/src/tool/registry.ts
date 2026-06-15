@@ -47,6 +47,7 @@ import { Bus } from "../bus"
 import { Agent } from "../agent/agent"
 import { Skill } from "../skill"
 import { Permission } from "@/permission"
+import { harnessToolEffects } from "../harness/tools"
 
 export namespace ToolRegistry {
   const log = Log.create({ service: "tool.registry" })
@@ -124,6 +125,8 @@ export namespace ToolRegistry {
       const patchtool = yield* ApplyPatchTool
       const skilltool = yield* SkillTool
       const agent = yield* Agent.Service
+
+      const harnessInfos = yield* Effect.all(harnessToolEffects)
 
       const state = yield* InstanceState.make<State>(
         Effect.fn("ToolRegistry.state")(function* (ctx) {
@@ -203,6 +206,10 @@ export namespace ToolRegistry {
             plan: Tool.init(plan),
           })
 
+          const harness = yield* Effect.all(
+            harnessInfos.map((t) => Tool.init(t)),
+          )
+
           return {
             custom,
             builtin: [
@@ -223,6 +230,7 @@ export namespace ToolRegistry {
               tool.patch,
               ...(Flag.OPENCODE_EXPERIMENTAL_LSP_TOOL ? [tool.lsp] : []),
               ...(Flag.OPENCODE_EXPERIMENTAL_PLAN_MODE && Flag.OPENCODE_CLIENT === "cli" ? [tool.plan] : []),
+              ...harness,
             ],
             task: tool.task,
             read: tool.read,

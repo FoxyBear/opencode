@@ -51,7 +51,7 @@ const singleFlag = process.argv.includes("--single")
 const baselineFlag = process.argv.includes("--baseline")
 const skipInstall = process.argv.includes("--skip-install")
 const plugin = createSolidTransformPlugin()
-const skipEmbedWebUi = process.argv.includes("--skip-embed-web-ui")
+const skipEmbedWebUi = singleFlag || process.argv.includes("--skip-embed-web-ui")
 
 const createEmbeddedWebUIBundle = async () => {
   console.log(`Building Web UI to embed in the binary`)
@@ -165,7 +165,7 @@ const targets = singleFlag
 await $`rm -rf dist`
 
 const binaries: Record<string, string> = {}
-if (!skipInstall) {
+if (!skipInstall && !singleFlag) {
   await $`bun install --os="*" --cpu="*" @opentui/core@${pkg.dependencies["@opentui/core"]}`
   await $`bun install --os="*" --cpu="*" @parcel/watcher@${pkg.dependencies["@parcel/watcher"]}`
 }
@@ -251,6 +251,27 @@ for (const item of targets) {
     ),
   )
   binaries[name] = Script.version
+}
+
+if (singleFlag) {
+  const nativeTarget = allTargets.find(
+    (t) => t.os === process.platform && t.arch === process.arch && !t.abi && t.avx2 !== false,
+  )
+  if (nativeTarget) {
+    const name = [pkg.name, nativeTarget.os === "win32" ? "windows" : nativeTarget.os, nativeTarget.arch]
+      .filter(Boolean)
+      .join("-")
+    const src = path.resolve(dir, `dist/${name}/bin/opencode`)
+    const dest = "/opt/homebrew/bin/foxybear"
+    if (fs.existsSync(src)) {
+      fs.copyFileSync(src, dest)
+      fs.chmodSync(dest, 0o755)
+      if (process.platform === "darwin") {
+        await $`codesign --force --sign - ${dest}`
+      }
+      console.log(`Installed ${dest}`)
+    }
+  }
 }
 
 if (Script.release) {

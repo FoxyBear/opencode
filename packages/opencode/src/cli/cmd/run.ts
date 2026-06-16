@@ -678,44 +678,34 @@ export const RunCommand = cmd({
 
       if (resolvedPersona) {
         PersonaSession.attach(sessionID as unknown as SessionID, resolvedPersona)
-        personaLog.info("persona attached to session", {
-          sessionID,
-          persona: resolvedPersona.name,
-        })
       }
 
-      try {
-        await share(sdk, sessionID)
+      await share(sdk, sessionID)
 
-        loop().catch((e) => {
-          console.error(e)
-          process.exit(1)
+      loop().catch((e) => {
+        console.error(e)
+        process.exit(1)
+      })
+
+      if (args.command) {
+        await sdk.session.command({
+          sessionID,
+          agent,
+          model: args.model,
+          command: args.command,
+          arguments: message,
+          variant: args.variant,
         })
-
-        if (args.command) {
-          await sdk.session.command({
-            sessionID,
-            agent,
-            model: args.model,
-            command: args.command,
-            arguments: message,
-            variant: args.variant,
-          })
-        } else {
-          const modelString = args.model ?? resolvedPersona?.model
-          const model = modelString ? Provider.parseModel(modelString) : undefined
-          await sdk.session.prompt({
-            sessionID,
-            agent,
-            model,
-            variant: args.variant,
-            parts: [...files, { type: "text", text: message }],
-          })
-        }
-      } finally {
-        if (resolvedPersona) {
-          PersonaSession.clear(sessionID as unknown as SessionID)
-        }
+      } else {
+        const modelID = args.model ?? resolvedPersona?.model
+        const model = modelID ? Provider.parseModel(modelID) : undefined
+        await sdk.session.prompt({
+          sessionID,
+          agent,
+          model,
+          variant: args.variant,
+          parts: [...files, { type: "text", text: message }],
+        })
       }
     }
 

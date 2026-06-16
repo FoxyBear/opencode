@@ -1,5 +1,6 @@
 import { Log } from "@/util/log"
 import { getGlobalConfig } from "@/config/bridge"
+import { hookPersonaDefault } from "../cli/cmd/tui/worker-persona-hook"
 import { initMemoryBackendFromConfig } from "../memory/init"
 import { Mesh } from "../mesh/mesh"
 import { getGlobalMemoryBackend, setGlobalMemoryBackend } from "../memory/backend-registry"
@@ -70,6 +71,12 @@ export async function initHarnessServices() {
 }
 
 export function initAll(directory: string) {
+  hookPersonaDefault(directory).catch((error) => {
+    Log.Default.warn("hookPersonaDefault threw", {
+      error: error instanceof Error ? error.message : error,
+    })
+  })
+
   initMemoryBackend().catch((error) => {
     Log.Default.warn("memory backend init failed, falling back to SQLite", {
       error: error instanceof Error ? error.message : error,

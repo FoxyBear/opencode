@@ -15,6 +15,8 @@ import type { EventSource } from "./context/sdk"
 import { win32DisableProcessedInput, win32InstallCtrlCGuard } from "./win32"
 import { TuiConfig } from "@/config/tui"
 import { Instance } from "@/project/instance"
+import { getConfig } from "@/config/bridge"
+import { PersonaSession } from "@/persona/session"
 import { writeHeapSnapshot } from "v8"
 
 declare global {
@@ -100,6 +102,10 @@ export const TuiThreadCommand = cmd({
       .option("agent", {
         type: "string",
         describe: "agent to use",
+      })
+      .option("persona", {
+        type: "string",
+        describe: "persona to use for this session (overrides config.persona)",
       }),
   handler: async (args) => {
     // Keep ENABLE_PROCESSED_INPUT cleared even if other code flips it.
@@ -130,6 +136,29 @@ export const TuiThreadCommand = cmd({
         return
       }
       const cwd = Filesystem.resolve(process.cwd())
+
+      const resolvedPersona = await Instance.provide({
+        directory: cwd,
+        async fn() {
+          const cfg = await getConfig().catch(() => ({}) as any)
+          const configuredMcpServers = Object.keys(cfg?.mcp ?? {})
+          const effectivePersona =
+            args.persona ??
+            (typeof cfg?.persona === "string" && cfg.persona.length > 0 ? cfg.persona : undefined)
+          if (!effectivePersona) return undefined
+          try {
+            return await PersonaSession.resolve(effectivePersona, configuredMcpServers)
+          } catch (err) {
+            UI.error(String(err instanceof Error ? err.message : err))
+            process.exitCode = 1
+            throw err
+          }
+        },
+      }).catch(() => undefined)
+      if (process.exitCode === 1) return
+      if (resolvedPersona?.name) {
+        process.env.OPENCODE_PERSONA = resolvedPersona.name
+      }
 
       const worker = new Worker(file, {
         env: Object.fromEntries(

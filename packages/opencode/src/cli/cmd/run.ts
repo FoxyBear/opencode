@@ -28,6 +28,33 @@ import { BashTool } from "../../tool/bash"
 import { TodoWriteTool } from "../../tool/todo"
 import { Locale } from "../../util/locale"
 import { AppRuntime } from "@/effect/app-runtime"
+import { Log } from "../../util/log"
+import { PersonaSession } from "../../persona/session"
+import { Config } from "../../config/config"
+import type { SessionID } from "../../session/schema"
+
+const personaLog = Log.create({ service: "cli.run.persona" })
+
+export async function resolveRunPersona(
+  opts: { cliPersona?: string; getConfig?: () => Promise<any> } = {},
+): Promise<PersonaSession.ResolvedPersona | undefined> {
+  let cfg: any = {}
+  try {
+    cfg = opts.getConfig ? await opts.getConfig() : await AppRuntime.runPromise(Config.Service.use((svc) => svc.get()))
+  } catch (err) {
+    personaLog.warn("config read failed; continuing without config-defaulted persona", {
+      error: String(err),
+    })
+    cfg = {}
+  }
+  const configuredMcpServers = Object.keys(cfg?.mcp ?? {})
+  const effectivePersona =
+    opts.cliPersona ??
+    (typeof cfg?.persona === "string" && cfg.persona.length > 0 ? cfg.persona : undefined)
+  if (!effectivePersona) return undefined
+
+  return await PersonaSession.resolve(effectivePersona, configuredMcpServers)
+}
 
 type ToolProps<T> = {
   input: Tool.InferParameters<T>
@@ -260,6 +287,10 @@ export const RunCommand = cmd({
       .option("agent", {
         type: "string",
         describe: "agent to use",
+      })
+      .option("persona", {
+        type: "string",
+        describe: "persona to use for this session (overrides config.persona)",
       })
       .option("format", {
         type: "string",
@@ -634,36 +665,57 @@ export const RunCommand = cmd({
         return name
       })()
 
+      const resolvedPersona = await resolveRunPersona({ cliPersona: args.persona }).catch((err) => {
+        personaLog.warn("persona resolution failed", { error: String(err) })
+        return undefined
+      })
+
       const sessionID = await session(sdk)
       if (!sessionID) {
         UI.error("Session not found")
         process.exit(1)
       }
-      await share(sdk, sessionID)
 
-      loop().catch((e) => {
-        console.error(e)
-        process.exit(1)
-      })
+      if (resolvedPersona) {
+        PersonaSession.attach(sessionID as unknown as SessionID, resolvedPersona)
+        personaLog.info("persona attached to session", {
+          sessionID,
+          persona: resolvedPersona.name,
+        })
+      }
 
-      if (args.command) {
-        await sdk.session.command({
-          sessionID,
-          agent,
-          model: args.model,
-          command: args.command,
-          arguments: message,
-          variant: args.variant,
+      try {
+        await share(sdk, sessionID)
+
+        loop().catch((e) => {
+          console.error(e)
+          process.exit(1)
         })
-      } else {
-        const model = args.model ? Provider.parseModel(args.model) : undefined
-        await sdk.session.prompt({
-          sessionID,
-          agent,
-          model,
-          variant: args.variant,
-          parts: [...files, { type: "text", text: message }],
-        })
+
+        if (args.command) {
+          await sdk.session.command({
+            sessionID,
+            agent,
+            model: args.model,
+            command: args.command,
+            arguments: message,
+            variant: args.variant,
+          })
+        } else {
+          const modelString = args.model ?? resolvedPersona?.model
+          const model = modelString ? Provider.parseModel(modelString) : undefined
+          await sdk.session.prompt({
+            sessionID,
+            agent,
+            model,
+            variant: args.variant,
+            parts: [...files, { type: "text", text: message }],
+          })
+        }
+      } finally {
+        if (resolvedPersona) {
+          PersonaSession.clear(sessionID as unknown as SessionID)
+        }
       }
     }
 

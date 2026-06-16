@@ -46,8 +46,13 @@ export const ChatReadTool = Tool.define(
     }),
     execute: (params: { space: string; max_results: number }, _ctx: Tool.Context) =>
       Effect.promise(async () => {
+        const raw = params.space.trim()
+        const spaceId = raw.startsWith("spaces/") ? raw.slice(7) : raw
+        if (!spaceId) {
+          return { title: "Error", output: "Space name is required. Use chat_spaces to find space names first.", metadata: { count: 0 } }
+        }
         const limit = Math.min(params.max_results, 25)
-        const space = params.space.startsWith("spaces/") ? params.space : `spaces/${params.space}`
+        const space = `spaces/${spaceId}`
         const data = await googleFetch(`${BASE}/${space}/messages?pageSize=${limit}&orderBy=createTime desc`)
         const messages = data.messages ?? []
 

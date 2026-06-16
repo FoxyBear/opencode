@@ -17,7 +17,7 @@ async function fetchWithAuthRetry(
     },
   })
 
-  if (res.status === 401 || res.status === 404) {
+  if (res.status === 401 || res.status === 403) {
     GoogleAuth._reset()
     const freshToken = await GoogleAuth.getAccessToken()
     if (freshToken && freshToken !== token) {

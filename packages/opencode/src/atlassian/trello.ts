@@ -58,8 +58,8 @@ export const TrelloCardsTool = Tool.define(
   Effect.succeed({
     description: "List cards on a board or in a specific list.",
     parameters: z.object({
-      board_id: z.string().optional().describe("Board ID (list all cards on board)"),
-      list_id: z.string().optional().describe("List ID (list cards in specific list)"),
+      board_id: z.string().min(1).optional().describe("Board ID (list all cards on board)"),
+      list_id: z.string().min(1).optional().describe("List ID (list cards in specific list)"),
       filter: z.enum(["open", "closed", "all"]).optional().default("open").describe("Card filter (default: open)"),
       max_results: z.number().optional().default(25).describe("Maximum cards to return"),
     }),

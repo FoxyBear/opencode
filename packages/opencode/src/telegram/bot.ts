@@ -406,7 +406,7 @@ export namespace TelegramBot {
     try {
       const answers = pending.answers.map((a) => [a!])
       const { Question } = await import("../question")
-      const ok = Question.globalReply(requestId, answers)
+      const ok = Question.globalReply(requestId as any, answers)
       if (!ok) {
         log.warn("telegram: question no longer pending", { requestId })
         await sendMessage(_config.bot_token!, chatId, "Question expired.")

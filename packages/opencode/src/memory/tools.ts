@@ -39,7 +39,7 @@ export const MemoryRememberTool = Tool.define(
           return {
             title: "Memory store failed",
             output: `Error storing memory: ${String(error)}`,
-            metadata: {},
+            metadata: { id: "" },
           }
         }
       }).pipe(Effect.orDie),
@@ -74,7 +74,7 @@ export const MemoryRecallTool = Tool.define(
             return {
               title: "No memories found",
               output: "No relevant memories found.",
-              metadata: {},
+              metadata: { count: 0 },
             }
           }
 
@@ -94,7 +94,7 @@ export const MemoryRecallTool = Tool.define(
           return {
             title: "Memory recall failed",
             output: `Error recalling memories: ${String(error)}`,
-            metadata: {},
+            metadata: { count: 0 },
           }
         }
       }).pipe(Effect.orDie),

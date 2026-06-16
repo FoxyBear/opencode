@@ -16,7 +16,7 @@ export const TelegramSendTool = Tool.define(
       Effect.promise(async () => {
         const config = TelegramBot.getConfig()
         if (!config.bot_token) {
-          return { title: "Not configured", output: "Telegram bot token not configured.", metadata: {} }
+          return { title: "Not configured", output: "Telegram bot token not configured.", metadata: { chat_id: "" } }
         }
 
         await tgSend(config.bot_token, params.chat_id, params.text)

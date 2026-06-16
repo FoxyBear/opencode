@@ -199,15 +199,15 @@ export namespace Question {
 
   export const defaultLayer = layer.pipe(Layer.provide(Bus.layer))
 
-  const _globalPending = new Map<string, Request>()
-  const _globalDeferreds = new Map<string, { resolve: (answers: Answer[]) => void }>()
+  const _globalPending = new Map<QuestionID, Request>()
+  const _globalDeferreds = new Map<QuestionID, { resolve: (answers: Answer[]) => void }>()
 
   export function globalRegister(req: Request, resolve: (answers: Answer[]) => void): void {
     _globalPending.set(req.id, req)
     _globalDeferreds.set(req.id, { resolve })
   }
 
-  export function globalUnregister(id: string): void {
+  export function globalUnregister(id: QuestionID): void {
     _globalPending.delete(id)
     _globalDeferreds.delete(id)
   }
@@ -216,7 +216,7 @@ export namespace Question {
     return Array.from(_globalPending.values())
   }
 
-  export function globalReply(requestId: string, answers: Answer[]): boolean {
+  export function globalReply(requestId: QuestionID, answers: Answer[]): boolean {
     const entry = _globalDeferreds.get(requestId)
     if (!entry) return false
     entry.resolve(answers)
@@ -225,7 +225,7 @@ export namespace Question {
     return true
   }
 
-  export function globalReject(requestId: string): boolean {
+  export function globalReject(requestId: QuestionID): boolean {
     const entry = _globalDeferreds.get(requestId)
     if (!entry) return false
     entry.resolve([])

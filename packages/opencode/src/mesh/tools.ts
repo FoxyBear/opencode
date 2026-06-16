@@ -83,7 +83,7 @@ export const MeshPeersTool = Tool.define(
           return {
             title: "Peer list failed",
             output: `Error listing peers: ${String(error)}`,
-            metadata: {},
+            metadata: { count: 0 },
           }
         }
       }),
@@ -131,7 +131,7 @@ export const MeshDelegateTool = Tool.define(
             return {
               title: "Peer returned error",
               output: result.error ?? "unknown peer error",
-              metadata: {},
+              metadata: { session_id: "" },
             }
           }
           const output = [...progress, result.response ?? ""].filter(Boolean).join("\n\n")
@@ -144,7 +144,7 @@ export const MeshDelegateTool = Tool.define(
           return {
             title: "Peer query failed",
             output: String(error instanceof Error ? error.message : error),
-            metadata: {},
+            metadata: { session_id: "" },
           }
         }
       }),

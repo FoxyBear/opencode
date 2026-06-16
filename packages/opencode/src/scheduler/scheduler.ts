@@ -428,7 +428,7 @@ export namespace Scheduler {
             const backend = getGlobalGraphBackend()
             if (!backend) return
             const config = await getConfig()
-            const embeddingConfig: Embedding.Config = {
+            const embeddingConfig = {
               provider: (config?.memory?.embedding?.provider as any) ?? "deepinfra",
               model: config?.memory?.embedding?.model ?? "BAAI/bge-base-en-v1.5",
               dimensions: config?.memory?.embedding?.dimensions ?? 768,

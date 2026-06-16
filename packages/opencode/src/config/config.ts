@@ -106,7 +106,7 @@ export namespace Config {
    * User-scoped plists are checked first, then machine-scoped.
    */
   async function readManagedPreferences(): Promise<Info> {
-    if (process.platform !== "darwin") return {}
+    if (process.platform !== "darwin") return {} as Info
 
     const domain = MANAGED_PLIST_DOMAIN
     const user = os.userInfo().username
@@ -125,7 +125,7 @@ export namespace Config {
       }
       return parseManagedPlist(result.stdout.toString(), `mobileconfig:${plist}`)
     }
-    return {}
+    return {} as Info
   }
 
   // Custom merge function that concatenates array fields instead of replacing them
@@ -1284,7 +1284,7 @@ export namespace Config {
           Effect.tapError((error) =>
             Effect.sync(() => log.error("failed to load global config, using defaults", { error: String(error) })),
           ),
-          Effect.orElseSucceed((): Info => ({})),
+          Effect.orElseSucceed((): Info => ({} as Info)),
         ),
         Duration.infinity,
       )
@@ -1364,7 +1364,7 @@ export namespace Config {
       const loadInstanceState = Effect.fnUntraced(function* (ctx: InstanceContext) {
         const auth = yield* authSvc.all().pipe(Effect.orDie)
 
-        let result: Info = {}
+        let result: Info = {} as Info
         const consoleManagedProviders = new Set<string>()
         let activeOrgName: string | undefined
 

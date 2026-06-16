@@ -129,7 +129,7 @@ export namespace Harness {
     if (routeDecision.route === "llm" && isFirstIteration && cfg?.memory) {
       try {
         const personaName =
-          PersonaSession.get(sessionID)?.name ??
+          PersonaSession.get(sessionID as any)?.name ??
           PersonaSession.getDefault()?.name ??
           "default"
         const results = await deps.autoRecall({

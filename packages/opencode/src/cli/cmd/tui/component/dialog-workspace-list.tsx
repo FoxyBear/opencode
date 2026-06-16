@@ -14,7 +14,7 @@ function scoped(sdk: ReturnType<typeof useSDK>, sync: ReturnType<typeof useSync>
   return createOpencodeClient({
     baseUrl: sdk.url,
     fetch: sdk.fetch,
-    directory: sync.data.path.directory || sdk.directory,
+    directory: (sync.data as any).path?.directory || sdk.directory,
     experimental_workspaceID: workspaceID,
   })
 }
@@ -129,7 +129,7 @@ function DialogWorkspaceCreate(props: { onSelect: (workspaceID: string) => Promi
       })
       return
     }
-    await sync.workspace.sync()
+    await (sync as any).workspace.sync()
     await props.onSelect(workspace.id)
     setCreating(undefined)
   }
@@ -212,15 +212,15 @@ export function DialogWorkspaceList() {
 
   let run = 0
   createEffect(() => {
-    const workspaces = sync.data.workspaceList
+    const workspaces: any[] = (sync.data as any).workspaceList ?? []
     const next = ++run
     if (!workspaces.length) {
       setCounts({})
       return
     }
-    setCounts(Object.fromEntries(workspaces.map((workspace) => [workspace.id, undefined])))
+    setCounts(Object.fromEntries(workspaces.map((workspace: any) => [workspace.id, undefined])))
     void Promise.all(
-      workspaces.map(async (workspace) => {
+      workspaces.map(async (workspace: any) => {
         const client = scoped(sdk, sync, workspace.id)
         const result = await client.session.list({ roots: true }).catch(() => undefined)
         return [workspace.id, result ? (result.data?.length ?? 0) : null] as const
@@ -239,7 +239,7 @@ export function DialogWorkspaceList() {
       description: "Use the local machine",
       footer: `${localCount()} session${localCount() === 1 ? "" : "s"}`,
     },
-    ...sync.data.workspaceList.map((workspace) => {
+    ...((sync.data as any).workspaceList ?? []).map((workspace: any) => {
       const count = counts()[workspace.id]
       return {
         title:
@@ -267,7 +267,7 @@ export function DialogWorkspaceList() {
 
   onMount(() => {
     dialog.setSize("large")
-    void sync.workspace.sync()
+    void (sync as any).workspace?.sync()
   })
 
   return (
@@ -311,7 +311,7 @@ export function DialogWorkspaceList() {
                 type: "home",
               })
             }
-            await sync.workspace.sync()
+            await (sync as any).workspace?.sync()
           },
         },
       ]}

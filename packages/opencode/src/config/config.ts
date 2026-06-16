@@ -178,7 +178,7 @@ export namespace Config {
       })
       if (!md) continue
 
-      const patterns = ["/.opencode/command/", "/.opencode/commands/", "/command/", "/commands/"]
+      const patterns = ["/.foxybear/command/", "/.foxybear/commands/", "/.opencode/command/", "/.opencode/commands/", "/command/", "/commands/"]
       const file = rel(item, patterns) ?? path.basename(item)
       const name = trim(file)
 
@@ -217,7 +217,7 @@ export namespace Config {
       })
       if (!md) continue
 
-      const patterns = ["/.opencode/agent/", "/.opencode/agents/", "/agent/", "/agents/"]
+      const patterns = ["/.foxybear/agent/", "/.foxybear/agents/", "/.opencode/agent/", "/.opencode/agents/", "/agent/", "/agents/"]
       const file = rel(item, patterns) ?? path.basename(item)
       const agentName = trim(file)
 
@@ -1031,6 +1031,18 @@ export namespace Config {
             .min(0)
             .optional()
             .describe("Token buffer for compaction. Leaves enough window to avoid overflow during compaction."),
+          max_failures: z
+            .number()
+            .int()
+            .min(1)
+            .optional()
+            .describe("Circuit breaker: disable auto-compaction after N consecutive failures (default: 3)"),
+          tier1_threshold: z
+            .number()
+            .min(0)
+            .max(1)
+            .optional()
+            .describe("Budget percentage threshold for tier-1 microcompaction (default: budgetPercent param)"),
         })
         .optional(),
       experimental: z
@@ -1430,7 +1442,7 @@ export namespace Config {
         const deps: Fiber.Fiber<void, never>[] = []
 
         for (const dir of unique(directories)) {
-          if (dir.endsWith(".opencode") || dir === Flag.OPENCODE_CONFIG_DIR) {
+          if (dir.endsWith(".foxybear") || dir.endsWith(".opencode") || dir === Flag.OPENCODE_CONFIG_DIR) {
             for (const file of ["foxybear.json", "foxybear.jsonc", "opencode.json", "opencode.jsonc"]) {
               const source = path.join(dir, file)
               log.debug(`loading config from ${source}`)

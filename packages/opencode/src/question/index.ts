@@ -224,4 +224,13 @@ export namespace Question {
     _globalDeferreds.delete(requestId)
     return true
   }
+
+  export function globalReject(requestId: string): boolean {
+    const entry = _globalDeferreds.get(requestId)
+    if (!entry) return false
+    entry.resolve([])
+    _globalPending.delete(requestId)
+    _globalDeferreds.delete(requestId)
+    return true
+  }
 }

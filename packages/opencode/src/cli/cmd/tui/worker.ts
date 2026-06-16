@@ -11,6 +11,7 @@ import { Flag } from "@/flag/flag"
 import { writeHeapSnapshot } from "node:v8"
 import { Heap } from "@/cli/heap"
 import { AppRuntime } from "@/effect/app-runtime"
+import { initAll as initHarness, handleHarnessRoute, shutdown as shutdownHarness } from "../../../harness/worker-init"
 
 await Log.init({
   print: process.argv.includes("--print-logs"),
@@ -44,6 +45,18 @@ let server: Awaited<ReturnType<typeof Server.listen>> | undefined
 
 export const rpc = {
   async fetch(input: { url: string; method: string; headers: Record<string, string>; body?: string }) {
+    const url = new URL(input.url)
+    try {
+      const harness = await handleHarnessRoute(url, input.body)
+      if (harness) return harness
+    } catch (err) {
+      return {
+        status: 500,
+        headers: {} as Record<string, string>,
+        body: JSON.stringify({ error: err instanceof Error ? err.message : String(err) }),
+      }
+    }
+
     const headers = { ...input.headers }
     const auth = getAuthorizationHeader()
     if (auth && !headers["authorization"] && !headers["Authorization"]) {
@@ -86,6 +99,7 @@ export const rpc = {
   async shutdown() {
     Log.Default.info("worker shutting down")
 
+    await shutdownHarness()
     await Instance.disposeAll()
     if (server) await server.stop(true)
   },
@@ -96,6 +110,6 @@ Rpc.listen(rpc)
 function getAuthorizationHeader(): string | undefined {
   const password = Flag.OPENCODE_SERVER_PASSWORD
   if (!password) return undefined
-  const username = Flag.OPENCODE_SERVER_USERNAME ?? "opencode"
+  const username = Flag.OPENCODE_SERVER_USERNAME ?? "foxybear"
   return `Basic ${btoa(`${username}:${password}`)}`
 }

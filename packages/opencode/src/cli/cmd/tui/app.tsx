@@ -63,6 +63,8 @@ import { FormatError, FormatUnknownError } from "@/cli/error"
 
 import type { EventSource } from "./context/sdk"
 import { DialogVariant } from "./component/dialog-variant"
+import { DialogWorkspaceList } from "@tui/component/dialog-workspace-list"
+import { HarnessCommands } from "@/harness/commands"
 
 function rendererConfig(_config: TuiConfig.Info): CliRendererConfig {
   const mouseEnabled = !Flag.OPENCODE_DISABLE_MOUSE && (_config.mouse ?? true)
@@ -242,6 +244,8 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
       setReady(true)
     })
 
+  HarnessCommands.connect({ url: sdk.url, fetch: sdk.fetch })
+
   useKeyboard((evt) => {
     if (!Flag.OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT) return
     const sel = renderer.getSelection()
@@ -294,24 +298,24 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
     if (!terminalTitleEnabled() || Flag.OPENCODE_DISABLE_TERMINAL_TITLE) return
 
     if (route.data.type === "home") {
-      renderer.setTerminalTitle("OpenCode")
+      renderer.setTerminalTitle("FoxyBear")
       return
     }
 
     if (route.data.type === "session") {
       const session = sync.session.get(route.data.sessionID)
       if (!session || SessionApi.isDefaultTitle(session.title)) {
-        renderer.setTerminalTitle("OpenCode")
+        renderer.setTerminalTitle("FoxyBear")
         return
       }
 
       const title = session.title.length > 40 ? session.title.slice(0, 37) + "..." : session.title
-      renderer.setTerminalTitle(`OC | ${title}`)
+      renderer.setTerminalTitle(`FB | ${title}`)
       return
     }
 
     if (route.data.type === "plugin") {
-      renderer.setTerminalTitle(`OC | ${route.data.id}`)
+      renderer.setTerminalTitle(`FB | ${route.data.id}`)
     }
   })
 
@@ -417,7 +421,6 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
       },
       onSelect: () => {
         const current = promptRef.current
-        // Don't require focus - if there's any text, preserve it
         const currentPrompt = current?.current?.input ? current.current : undefined
         route.navigate({
           type: "home",
@@ -426,6 +429,21 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
         dialog.clear()
       },
     },
+    ...(Flag.OPENCODE_EXPERIMENTAL_WORKSPACES
+      ? [
+          {
+            title: "Manage workspaces",
+            value: "workspace.list",
+            category: "Session",
+            slash: {
+              name: "workspaces",
+            },
+            onSelect: () => {
+              dialog.replace(() => <DialogWorkspaceList />)
+            },
+          },
+        ]
+      : []),
     {
       title: "Switch model",
       value: "model.list",
@@ -729,6 +747,19 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
         dialog.clear()
       },
     },
+    ...HarnessCommands.all().map((cmd) => ({
+      title: cmd.description || cmd.name,
+      value: `harness.${cmd.name}`,
+      category: "Harness",
+      slash: { name: cmd.name },
+      onSelect: async () => {
+        const result = await HarnessCommands.execute(cmd.name, "")
+        if (result) {
+          await DialogAlert.show(dialog, cmd.name, typeof result === "string" ? result : JSON.stringify(result, null, 2))
+        }
+        dialog.clear()
+      },
+    })),
   ])
 
   event.on(TuiEvent.CommandExecute.type, (evt) => {
@@ -814,7 +845,7 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
     await DialogAlert.show(
       dialog,
       "Update Complete",
-      `Successfully updated to OpenCode v${result.data.version}. Please restart the application.`,
+      `Successfully updated to FoxyBear v${result.data.version}. Please restart the application.`,
     )
 
     exit()

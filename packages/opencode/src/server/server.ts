@@ -9,6 +9,8 @@ import { initProjectors } from "./projectors"
 import { Log } from "@/util/log"
 import { ControlPlaneRoutes } from "./control"
 import { UIRoutes } from "./ui"
+import { MeshRoutes } from "@/mesh/routes"
+import { SchedulerRoutes } from "./routes/scheduler"
 
 // @ts-ignore This global is needed to prevent ai-sdk from logging warnings to stdout https://github.com/vercel/ai/blob/2dc67e0ef538307f21368db32d5a12345d98831b/packages/ai/src/logger/log-warnings.ts#L85
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -27,19 +29,24 @@ export namespace Server {
 
   export const Default = lazy(() => create({}))
 
-  function create(opts: { cors?: string[] }) {
+  function create(opts: { cors?: string[]; extraRoutes?: Hono }) {
     const app = new Hono()
     const runtime = adapter.create(app)
+    const chain = app
+      .onError(ErrorMiddleware)
+      .use(AuthMiddleware)
+      .use(LoggerMiddleware)
+      .use(CompressionMiddleware)
+      .use(CorsMiddleware(opts))
+      .route("/", ControlPlaneRoutes())
+      .route("/mesh", MeshRoutes())
+      .route("/scheduler", SchedulerRoutes())
+      .route("/", InstanceRoutes(runtime.upgradeWebSocket))
+    if (opts.extraRoutes) {
+      chain.route("/", opts.extraRoutes)
+    }
     return {
-      app: app
-        .onError(ErrorMiddleware)
-        .use(AuthMiddleware)
-        .use(LoggerMiddleware)
-        .use(CompressionMiddleware)
-        .use(CorsMiddleware(opts))
-        .route("/", ControlPlaneRoutes())
-        .route("/", InstanceRoutes(runtime.upgradeWebSocket))
-        .route("/", UIRoutes()),
+      app: chain.route("/", UIRoutes()),
       runtime,
     }
   }
@@ -71,6 +78,7 @@ export namespace Server {
     mdns?: boolean
     mdnsDomain?: string
     cors?: string[]
+    extraRoutes?: Hono
   }): Promise<Listener> {
     const built = create(opts)
     const server = await built.runtime.listen(opts)

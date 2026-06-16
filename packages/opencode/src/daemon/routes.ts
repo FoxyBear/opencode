@@ -79,6 +79,14 @@ export function memoryRoutes() {
       await backend.forget(id)
       return c.json({ ok: true })
     })
+    .get("/memory/list", async (c) => {
+      const backend = getGlobalMemoryBackend()
+      if (!backend) return c.json({ error: "memory backend not available" }, 503)
+      const persona = c.req.query("persona") ?? "default"
+      const limitStr = c.req.query("limit")
+      const results = await backend.list(persona, limitStr ? parseInt(limitStr, 10) : undefined)
+      return c.json(results)
+    })
     .post("/memory/list", async (c) => {
       const backend = getGlobalMemoryBackend()
       if (!backend) return c.json({ error: "memory backend not available" }, 503)

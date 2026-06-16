@@ -22,6 +22,10 @@ async function startDaemon(args: NetworkOptions & { background?: boolean }) {
   }
 
   const networkOpts = await resolveNetworkOptions(args)
+
+  DaemonPid.acquire()
+  process.on("exit", () => DaemonPid.remove())
+
   const config = await getGlobalConfig()
 
   const surrealConfig = config?.memory?.surreal
@@ -149,7 +153,7 @@ async function startDaemon(args: NetworkOptions & { background?: boolean }) {
         fatal: true,
         async init() {
           Runner.wire({})
-          listener = await Server.listen(networkOpts)
+          listener = await Server.listen({ ...networkOpts, extraRoutes: DaemonRoutes() })
         },
         async stop() {
           if (listener) await listener.stop(true)

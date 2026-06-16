@@ -29,6 +29,9 @@ async function initMemoryBackend() {
   if (_memoryBackendInitialized) return
   _memoryBackendInitialized = true
 
+  // Don't overwrite a backend already set by daemon lifecycle
+  if (getGlobalMemoryBackend()) return
+
   const cfg = await getGlobalConfig()
   const backendType = (cfg?.memory?.graph_backend ?? "sqlite") as "sqlite" | "surreal"
   await initMemoryBackendFromConfig(backendType)

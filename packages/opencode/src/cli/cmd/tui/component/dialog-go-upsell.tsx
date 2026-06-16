@@ -51,7 +51,7 @@ export function DialogGoUpsell(props: DialogGoUpsellProps) {
       </box>
       <box gap={1} paddingBottom={1}>
         <text fg={theme.textMuted}>
-          Subscribe to OpenCode Go to keep going with reliable access to the best open-source models, starting at
+          Subscribe to FoxyBear Go to keep going with reliable access to the best open-source models, starting at
           $5/month.
         </text>
         <box flexDirection="row" gap={1}>

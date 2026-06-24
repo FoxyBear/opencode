@@ -38,6 +38,7 @@ import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
 import { SessionStatus } from "./status"
 import { LLM } from "./llm"
+import { PersonaSession } from "../persona/session"
 import { Shell } from "@/shell/shell"
 import { AppFileSystem } from "@/filesystem"
 import { Truncate } from "@/tool/truncate"
@@ -1477,7 +1478,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 instruction.system().pipe(Effect.orDie),
                 MessageV2.toModelMessagesEffect(msgs, model),
               ])
-              const system = [...env, ...(skills ? [skills] : []), ...instructions]
+              const personaPrompt =
+                (PersonaSession.get(sessionID) ?? PersonaSession.getDefault())?.systemPrompt
+              const system = [
+                ...(personaPrompt ? [personaPrompt] : []),
+                ...env,
+                ...(skills ? [skills] : []),
+                ...instructions,
+              ]
               const format = lastUser.format ?? { type: "text" as const }
               if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
               const result = yield* handle.process({

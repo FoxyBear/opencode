@@ -166,19 +166,21 @@ export async function runCouncil(
   previousScores.push(ruling1.convergenceScore);
   rounds.push({ roundNumber: 1, proposals: currentProposals, critiques: currentCritiques, ruling: ruling1 });
 
-  if (ruling1.converged || ruling1.action === "conclude") {
-    onProgress?.("round", ruling1.converged ? `Consensus reached in round 1` : `Concluded by arbitrator in round 1`);
+  let latestRuling = ruling1;
+
+  if (latestRuling.converged || latestRuling.action === "conclude") {
+    onProgress?.("round", latestRuling.converged ? `Consensus reached in round 1` : `Concluded by arbitrator in round 1`);
     const synthesis = await runner.run(
       config.arbitrator,
       buildSynthesizePrompt(
         currentProposals.map((p) => ({ modelName: p.modelName, proposal: p.content })),
         currentCritiques,
-        { agreements: ruling1.agreements, disagreements: ruling1.disagreements },
+        { agreements: latestRuling.agreements, disagreements: latestRuling.disagreements },
         prompt
       ),
       "Synthesize the final output."
     );
-    return { prompt, researchBriefs, rounds, finalSynthesis: synthesis, consensusReached: ruling1.converged, totalRounds: 1 };
+    return { prompt, researchBriefs, rounds, finalSynthesis: synthesis, consensusReached: latestRuling.converged, totalRounds: 1 };
   }
 
   // Rounds 2+: Revise → Critique → Arbitrate
@@ -189,14 +191,14 @@ export async function runCouncil(
     currentProposals = await Promise.all(
       assignments.map(async (assignment) => {
         const myProposal = currentProposals.find((p) => p.modelName === assignment.model.name)?.content ?? "";
-        const directive = ruling1.directives[assignment.model.id] ?? "";
-        const synthesizedCritique = ruling1.synthesizedCritiques[assignment.model.id] ?? "";
+        const directive = latestRuling.directives[assignment.model.id] ?? "";
+        const synthesizedCritique = latestRuling.synthesizedCritiques[assignment.model.id] ?? "";
         const revisePrompt = buildRevisePrompt(
           assignment.model.name,
           myProposal,
           directive,
           synthesizedCritique,
-          { agreements: ruling1.agreements, disagreements: ruling1.disagreements },
+          { agreements: latestRuling.agreements, disagreements: latestRuling.disagreements },
           prompt
         );
         const content = await runner.run(assignment.model, revisePrompt, `Revise your proposal for round ${roundNum}.`);
@@ -251,6 +253,7 @@ export async function runCouncil(
     const ruling = parseRuling(arbitrateResult, config.threshold);
     previousScores.push(ruling.convergenceScore);
     rounds.push({ roundNumber: roundNum, proposals: currentProposals, critiques: currentCritiques, ruling });
+    latestRuling = ruling;
 
     if (ruling.converged || ruling.action === "conclude") {
       break;

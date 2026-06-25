@@ -52,6 +52,11 @@ async function initTelegram() {
 
 export async function initHarnessServices() {
   await Promise.allSettled([
+    hookPersonaDefault("").catch((error) => {
+      Log.Default.warn("hookPersonaDefault threw", {
+        error: error instanceof Error ? error.message : error,
+      })
+    }),
     initMemoryBackend().catch((error) => {
       Log.Default.warn("memory backend init failed, falling back to SQLite", {
         error: error instanceof Error ? error.message : error,
@@ -70,31 +75,6 @@ export async function initHarnessServices() {
   ])
 }
 
-export function initAll(directory: string) {
-  hookPersonaDefault(directory).catch((error) => {
-    Log.Default.warn("hookPersonaDefault threw", {
-      error: error instanceof Error ? error.message : error,
-    })
-  })
-
-  initMemoryBackend().catch((error) => {
-    Log.Default.warn("memory backend init failed, falling back to SQLite", {
-      error: error instanceof Error ? error.message : error,
-    })
-  })
-
-  initMesh().catch((error) => {
-    Log.Default.warn("mesh init failed", {
-      error: error instanceof Error ? error.message : error,
-    })
-  })
-
-  initTelegram().catch((error) => {
-    Log.Default.warn("telegram config init failed", {
-      error: error instanceof Error ? error.message : error,
-    })
-  })
-}
 
 const HARNESS_PATHS = new Set(["/status", "/health", "/memory/list", "/memory/forget"])
 

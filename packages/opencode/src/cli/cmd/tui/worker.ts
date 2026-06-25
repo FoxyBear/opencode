@@ -11,7 +11,7 @@ import { Flag } from "@/flag/flag"
 import { writeHeapSnapshot } from "node:v8"
 import { Heap } from "@/cli/heap"
 import { AppRuntime } from "@/effect/app-runtime"
-import { initAll as initHarness, handleHarnessRoute, shutdown as shutdownHarness } from "../../../harness/worker-init"
+import { handleHarnessRoute, shutdown as shutdownHarness } from "../../../harness/worker-init"
 
 await Log.init({
   print: process.argv.includes("--print-logs"),

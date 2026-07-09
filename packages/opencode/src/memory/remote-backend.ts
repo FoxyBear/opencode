@@ -27,7 +27,7 @@ export class RemoteMemoryBackend implements MemoryBackend {
   async write(input: WriteInput): Promise<{ id: string }> {
     const body = {
       content: input.content,
-      embedding: Array.from(input.embedding),
+      embedding: input.embedding ? Array.from(input.embedding) : [],
       scope: input.scope,
       persona: input.persona,
       project_id: input.project_id,

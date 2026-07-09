@@ -37,7 +37,7 @@ export interface MemoryBackend {
 
 export interface WriteInput {
   readonly content: string
-  readonly embedding: Float32Array
+  readonly embedding?: Float32Array | null
   readonly scope: "instance" | "project" | "global"
   readonly project_id?: string
   readonly persona: string

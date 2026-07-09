@@ -235,9 +235,14 @@ export namespace Memory {
 
   // ── Embedding helper (uses raw async functions) ──
 
-  async function getEmbedding(text: string): Promise<Float32Array> {
+  async function getEmbedding(text: string): Promise<Float32Array | null> {
     const cfg = await resolveConfig()
-    return Embedding.embed(text, cfg.embeddingConfig)
+    const result = await Embedding.embedSafe(text, cfg.embeddingConfig)
+    if (!result.ok) {
+      log.warn("embedding unavailable, storing without vector", { error: result.error.message })
+      return null
+    }
+    return result.value
   }
 
   // ── Core implementations ──
@@ -290,49 +295,51 @@ export namespace Memory {
 
     // ── Legacy SQLite path ──
     const cfg = await resolveConfig()
-    const embeddingBuf = float32ToBuffer(embedding)
+    const EMPTY_EMBEDDING_BUF = Buffer.alloc(0)
+    const embeddingBuf = embedding ? float32ToBuffer(embedding) : EMPTY_EMBEDDING_BUF
     const projectId = input.project_id ?? "global"
 
-    // Check for duplicates within same project
-    const existing = Database.use((db) =>
-      db.select().from(MemoryTopicsTable).where(
-        and(eq(MemoryTopicsTable.persona, input.persona), eq(MemoryTopicsTable.project_id, projectId)),
-      ).all(),
-    )
+    // Check for duplicates within same project (skip if no embedding)
+    if (embedding) {
+      const existing = Database.use((db) =>
+        db.select().from(MemoryTopicsTable).where(
+          and(eq(MemoryTopicsTable.persona, input.persona), eq(MemoryTopicsTable.project_id, projectId)),
+        ).all(),
+      )
 
-    for (const row of existing) {
-      const existingEmb = bufferToFloat32(row.embedding as Buffer)
-      const sim = cosineSimilarity(embedding, existingEmb)
-      if (sim > cfg.dedupThreshold) {
-        // Dedup: merge content, update accessed_at, increment access_count
-        const mergedContent = row.content.includes(content)
-          ? row.content
-          : `${row.content}\n${content}`
-        const newAccessCount = (row.access_count ?? 0) + 1
-        const now = new Date()
+      for (const row of existing) {
+        const existingEmb = bufferToFloat32(row.embedding as Buffer)
+        const sim = cosineSimilarity(embedding, existingEmb)
+        if (sim > cfg.dedupThreshold) {
+          const mergedContent = row.content.includes(content)
+            ? row.content
+            : `${row.content}\n${content}`
+          const newAccessCount = (row.access_count ?? 0) + 1
+          const now = new Date()
 
-        Database.use((db) => {
-          db.update(MemoryTopicsTable)
-            .set({
-              content: mergedContent,
-              embedding: embeddingBuf,
-              access_count: newAccessCount,
-              time_accessed: now,
-              metadata: input.metadata ? JSON.stringify(input.metadata) : row.metadata,
-            })
-            .where(eq(MemoryTopicsTable.id, row.id))
-            .run()
-        })
+          Database.use((db) => {
+            db.update(MemoryTopicsTable)
+              .set({
+                content: mergedContent,
+                embedding: embeddingBuf,
+                access_count: newAccessCount,
+                time_accessed: now,
+                metadata: input.metadata ? JSON.stringify(input.metadata) : row.metadata,
+              })
+              .where(eq(MemoryTopicsTable.id, row.id))
+              .run()
+          })
 
-        return {
-          id: row.id,
-          content: mergedContent,
-          persona: row.persona,
-          scope: row.scope ?? "general",
-          access_count: newAccessCount,
-          created_at: String(row.time_created ?? ""),
-          accessed_at: String(now.getTime()),
-          metadata: (input.metadata ?? (row.metadata as Record<string, unknown>)) ?? {},
+          return {
+            id: row.id,
+            content: mergedContent,
+            persona: row.persona,
+            scope: row.scope ?? "general",
+            access_count: newAccessCount,
+            created_at: String(row.time_created ?? ""),
+            accessed_at: String(now.getTime()),
+            metadata: (input.metadata ?? (row.metadata as Record<string, unknown>)) ?? {},
+          }
         }
       }
     }
@@ -498,6 +505,11 @@ export namespace Memory {
   }): Promise<MemoryResult[]> {
     const limit = input.limit ?? DEFAULT_RECALL_LIMIT
     const queryEmbedding = await getEmbedding(input.query)
+
+    if (!queryEmbedding) {
+      log.warn("recall: embedding unavailable, returning empty results")
+      return []
+    }
 
     // ── Dispatch to SurrealBackend when registered ──
     const backend = getGlobalMemoryBackend()
@@ -799,6 +811,11 @@ export namespace Memory {
 
       const queryEmbedding = await getEmbedding(input.query)
 
+      if (!queryEmbedding) {
+        clearTimeout(timeout)
+        return mergeAndDedup(localResults, [])
+      }
+
       const response = await fetch(`${input.workforceUrl}/recall`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -852,10 +869,17 @@ export namespace Memory {
 
     const merged: MemoryResult[] = [...local]
 
-    // Embed local results for cosine comparison
-    const localEmbeddings: Float32Array[] = []
+    // Embed local results for cosine comparison (skip vector dedup if embedding is unavailable)
+    const localEmbeddings: (Float32Array | null)[] = []
+    let embeddingAvailable = true
     for (const loc of local) {
-      localEmbeddings.push(await Embedding.embed(loc.content, cfg.embeddingConfig))
+      const result = await Embedding.embedSafe(loc.content, cfg.embeddingConfig)
+      if (result.ok) {
+        localEmbeddings.push(result.value)
+      } else {
+        embeddingAvailable = false
+        localEmbeddings.push(null)
+      }
     }
 
     for (const wf of workforce) {
@@ -864,13 +888,14 @@ export namespace Memory {
       // Exact match check first (cheap)
       if (local.some((loc) => loc.content === wf.content)) {
         isDuplicate = true
-      } else {
-        // Cosine similarity check (spec compliance: cosine > 0.9)
-        const wfEmbedding = await Embedding.embed(wf.content, cfg.embeddingConfig)
-        for (const locEmb of localEmbeddings) {
-          if (cosineSimilarity(locEmb, wfEmbedding) > DEDUP_THRESHOLD) {
-            isDuplicate = true
-            break
+      } else if (embeddingAvailable) {
+        const wfResult = await Embedding.embedSafe(wf.content, cfg.embeddingConfig)
+        if (wfResult.ok) {
+          for (const locEmb of localEmbeddings) {
+            if (locEmb && cosineSimilarity(locEmb, wfResult.value) > DEDUP_THRESHOLD) {
+              isDuplicate = true
+              break
+            }
           }
         }
       }

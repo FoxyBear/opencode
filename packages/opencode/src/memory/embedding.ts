@@ -127,6 +127,33 @@ export namespace Embedding {
     }
   }
 
+  // ── Retry logic for transient errors (429, 503) ──
+
+  const MAX_RETRIES = 3
+  const BASE_DELAY_MS = 500
+
+  function isRetryable(error: unknown): boolean {
+    const msg = String(error)
+    return msg.includes(" 429:") || msg.includes(" 503:")
+  }
+
+  async function withRetry(fn: () => Promise<Float32Array>, provider: string): Promise<Float32Array> {
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        return await fn()
+      } catch (err) {
+        if (attempt < MAX_RETRIES && isRetryable(err)) {
+          const delay = BASE_DELAY_MS * Math.pow(2, attempt) + Math.random() * 200
+          log.warn("retrying embedding", { provider, attempt: attempt + 1, delay: Math.round(delay) })
+          await new Promise((r) => setTimeout(r, delay))
+          continue
+        }
+        throw err
+      }
+    }
+    throw new Error("unreachable")
+  }
+
   // ── Public API ──
 
   // Max input tokens per embedding model. ~4 chars per token, use 3.5 for safety.
@@ -148,6 +175,7 @@ export namespace Embedding {
 
   /**
    * Embed text using the configured provider, with fallback support.
+   * Retries on transient errors (429/503) before falling through.
    * Throws EmbeddingUnavailableError if all providers fail.
    */
   export async function embed(text: string, config: Config): Promise<Float32Array> {
@@ -156,7 +184,7 @@ export namespace Embedding {
     const primaryFn = getProviderFn(config.provider)
 
     try {
-      return await primaryFn(truncated, config.model)
+      return await withRetry(() => primaryFn(truncated, config.model), config.provider)
     } catch (primaryError) {
       log.warn("primary embedding provider failed", {
         provider: config.provider,
@@ -166,7 +194,7 @@ export namespace Embedding {
       if (config.fallback) {
         try {
           const fallbackFn = getProviderFn(config.fallback.provider)
-          return await fallbackFn(truncated, config.fallback.model)
+          return await withRetry(() => fallbackFn(truncated, config.fallback!.model), config.fallback.provider)
         } catch (fallbackError) {
           log.error("fallback embedding provider also failed", {
             provider: config.fallback.provider,

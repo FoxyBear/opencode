@@ -721,7 +721,9 @@ async function resolveEmbeddingConfig(): Promise<Embedding.Config> {
 
 async function getEmbedding(text: string): Promise<Float32Array> {
   const cfg = await resolveEmbeddingConfig()
-  return Embedding.embed(text, cfg)
+  const result = await Embedding.embedSafe(text, cfg)
+  if (!result.ok) throw result.error
+  return result.value
 }
 
 // ── Consolidation Result ──

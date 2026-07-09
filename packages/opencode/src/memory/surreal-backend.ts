@@ -105,7 +105,7 @@ export class SurrealBackend implements MemoryBackend {
 
     const fields = {
       content: input.content,
-      embedding: Array.from(input.embedding),
+      embedding: input.embedding ? Array.from(input.embedding) : [],
       persona: input.persona,
       scope: input.scope,
       project_id: projectId,

@@ -129,6 +129,12 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
     )
   })
 
+  const flatIndexOf = createMemo(() => {
+    const map = new WeakMap<DialogSelectOption<T>, number>()
+    flat().forEach((opt, i) => map.set(opt, i))
+    return map
+  })
+
   const rows = createMemo(() => {
     const headers = grouped().reduce((acc, [category], i) => {
       if (!category) return acc
@@ -171,7 +177,7 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
     if (option) props.onMove?.(option)
     if (!scroll) return
     const target = scroll.getChildren().find((child) => {
-      return child.id === JSON.stringify(selected()?.value)
+      return child.id === `opt-${next}`
     })
     if (!target) return
     const y = target.y - scroll.y
@@ -184,7 +190,7 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
       }
       if (y < 0) {
         scroll.scrollBy(y)
-        if (isDeepEqual(flat()[0].value, selected()?.value)) {
+        if (store.selected === 0) {
           scroll.scrollTo(0)
         }
       }
@@ -314,7 +320,7 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
                     const current = createMemo(() => isDeepEqual(option.value, props.current))
                     return (
                       <box
-                        id={JSON.stringify(option.value)}
+                        id={`opt-${flatIndexOf().get(option) ?? ""}`}
                         flexDirection="row"
                         position="relative"
                         onMouseMove={() => {
@@ -326,13 +332,13 @@ export function DialogSelect<T>(props: DialogSelectProps<T>) {
                         }}
                         onMouseOver={() => {
                           if (store.input !== "mouse") return
-                          const index = flat().findIndex((x) => isDeepEqual(x.value, option.value))
-                          if (index === -1) return
+                          const index = flatIndexOf().get(option)
+                          if (index === undefined) return
                           moveTo(index)
                         }}
                         onMouseDown={() => {
-                          const index = flat().findIndex((x) => isDeepEqual(x.value, option.value))
-                          if (index === -1) return
+                          const index = flatIndexOf().get(option)
+                          if (index === undefined) return
                           moveTo(index)
                         }}
                         backgroundColor={active() ? (option.bg ?? theme.primary) : RGBA.fromInts(0, 0, 0, 0)}

@@ -804,6 +804,94 @@ export namespace Provider {
             },
           },
         }),
+      deepinfra: Effect.fnUntraced(function* (input: Info) {
+        return {
+          autoload: false,
+          async discoverModels(): Promise<Record<string, Model>> {
+            try {
+              const res = await fetch("https://api.deepinfra.com/models/list", {
+                headers: { "User-Agent": Installation.USER_AGENT },
+                signal: AbortSignal.timeout(10000),
+              })
+              if (!res.ok) return {}
+              const data = (await res.json()) as any[]
+
+              const models: Record<string, Model> = {}
+              const now = Date.now() / 1000
+
+              for (const m of data) {
+                if (m.type !== "text-generation") continue
+                if (m.deprecated && m.deprecated < now) continue
+                if (input.models[m.model_name]) continue
+
+                const pricing = m.pricing ?? {}
+                const inputCost = (pricing.cents_per_input_token ?? 0) * 10000
+                const outputCost = (pricing.cents_per_output_token ?? 0) * 10000
+                const cacheReadRate = pricing.rate_per_input_token_cached
+                const cacheRead = typeof cacheReadRate === "number" ? inputCost * cacheReadRate : 0
+
+                const tags = new Set(m.tags ?? [])
+                const context = m.max_tokens ?? 0
+
+                models[m.model_name] = {
+                  id: ModelID.make(m.model_name),
+                  providerID: ProviderID.make("deepinfra"),
+                  name: m.model_name.split("/").pop() ?? m.model_name,
+                  family: "",
+                  api: {
+                    id: m.model_name,
+                    url: "https://api.deepinfra.com/v1/openai",
+                    npm: "@ai-sdk/deepinfra",
+                  },
+                  status: "active",
+                  headers: {},
+                  options: {},
+                  cost: {
+                    input: inputCost,
+                    output: outputCost,
+                    cache: { read: cacheRead, write: 0 },
+                  },
+                  limit: {
+                    context,
+                    output: Math.min(Math.floor(context / 4), 16384),
+                  },
+                  capabilities: {
+                    temperature: true,
+                    reasoning: tags.has("reasoning"),
+                    attachment: tags.has("multimodal"),
+                    toolcall: tags.has("tools"),
+                    input: {
+                      text: true,
+                      audio: false,
+                      image: tags.has("multimodal"),
+                      video: false,
+                      pdf: false,
+                    },
+                    output: {
+                      text: true,
+                      audio: false,
+                      image: false,
+                      video: false,
+                      pdf: false,
+                    },
+                    interleaved: false,
+                  },
+                  release_date: m.create_ts?.split("T")[0] ?? "",
+                  variants: {},
+                }
+              }
+
+              log.info("deepinfra model discovery complete", {
+                count: Object.keys(models).length,
+              })
+              return models
+            } catch (e) {
+              log.warn("deepinfra model discovery failed", { error: e })
+              return {}
+            }
+          },
+        }
+      }),
       kilo: () =>
         Effect.succeed({
           autoload: false,
@@ -1264,19 +1352,27 @@ export namespace Provider {
             mergeProvider(providerID, partial)
           }
 
-          const gitlab = ProviderID.make("gitlab")
-          if (discoveryLoaders[gitlab] && providers[gitlab] && isProviderAllowed(gitlab)) {
+          const discoveriesToRun = Object.entries(discoveryLoaders).filter(([id]) => {
+            const pid = ProviderID.make(id)
+            return providers[pid] && isProviderAllowed(pid)
+          })
+          if (discoveriesToRun.length > 0) {
             yield* Effect.promise(async () => {
-              try {
-                const discovered = await discoveryLoaders[gitlab]()
-                for (const [modelID, model] of Object.entries(discovered)) {
-                  if (!providers[gitlab].models[modelID]) {
-                    providers[gitlab].models[modelID] = model
+              await Promise.allSettled(
+                discoveriesToRun.map(async ([id, loader]) => {
+                  const pid = ProviderID.make(id)
+                  try {
+                    const discovered = await loader()
+                    for (const [modelID, model] of Object.entries(discovered)) {
+                      if (!providers[pid].models[modelID]) {
+                        providers[pid].models[modelID] = model
+                      }
+                    }
+                  } catch (e) {
+                    log.warn("state discovery error", { id, error: e })
                   }
-                }
-              } catch (e) {
-                log.warn("state discovery error", { id: "gitlab", error: e })
-              }
+                }),
+              )
             })
           }
 

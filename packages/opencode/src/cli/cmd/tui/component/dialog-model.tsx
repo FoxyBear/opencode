@@ -91,14 +91,6 @@ export function DialogModel(props: { providerID?: string }) {
               onSelect(provider.id, model)
             },
           })),
-          filter((x) => {
-            if (!showSections) return true
-            if (favorites.some((item) => item.providerID === x.value.providerID && item.modelID === x.value.modelID))
-              return false
-            if (recents.some((item) => item.providerID === x.value.providerID && item.modelID === x.value.modelID))
-              return false
-            return true
-          }),
           sortBy(
             (x) => x.footer !== "Free",
             (x) => x.title,

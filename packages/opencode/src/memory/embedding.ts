@@ -1,6 +1,9 @@
 import { NamedError } from "@opencode-ai/util/error"
 import z from "zod"
 import { Effect, Layer, Context } from "effect"
+import { readFileSync, existsSync } from "fs"
+import { resolve } from "path"
+import { homedir } from "os"
 import { Log } from "../util/log"
 
 const log = Log.create({ service: "memory.embedding" })
@@ -65,6 +68,33 @@ export namespace Embedding {
     | { ok: true; value: T }
     | { ok: false; error: EmbeddingUnavailableError }
 
+  // ── API key resolution (env → key file → auth store) ──
+
+  const KEY_FILES: Record<string, string> = {
+    DEEPINFRA_API_KEY: ".deepinfra.key",
+    OPENAI_API_KEY: ".openai_api.key",
+  }
+
+  function resolveApiKey(envVar: string, provider: string): string {
+    if (process.env[envVar]) return process.env[envVar]!
+    const filename = KEY_FILES[envVar]
+    if (filename) {
+      const keyPath = resolve(homedir(), "Development", filename)
+      try {
+        if (existsSync(keyPath)) {
+          const key = readFileSync(keyPath, "utf-8").trim()
+          if (key) return key
+        }
+      } catch {}
+    }
+    try {
+      const authPath = resolve(homedir(), ".opencode", "data", "auth.json")
+      const auth = JSON.parse(readFileSync(authPath, "utf-8"))
+      if (auth[provider]?.type === "api" && auth[provider]?.key) return auth[provider].key
+    } catch {}
+    return ""
+  }
+
   // ── Provider implementations ──
 
   async function embedOllama(text: string, model: string): Promise<Float32Array> {
@@ -81,7 +111,7 @@ export namespace Embedding {
   }
 
   async function embedDeepInfra(text: string, model: string): Promise<Float32Array> {
-    const apiKey = process.env.DEEPINFRA_API_KEY ?? ""
+    const apiKey = resolveApiKey("DEEPINFRA_API_KEY", "deepinfra")
     const response = await fetch("https://api.deepinfra.com/v1/openai/embeddings", {
       method: "POST",
       headers: {
@@ -98,7 +128,7 @@ export namespace Embedding {
   }
 
   async function embedOpenAI(text: string, model: string): Promise<Float32Array> {
-    const apiKey = process.env.OPENAI_API_KEY ?? ""
+    const apiKey = resolveApiKey("OPENAI_API_KEY", "openai")
     const response = await fetch("https://api.openai.com/v1/embeddings", {
       method: "POST",
       headers: {

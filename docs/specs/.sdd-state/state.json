@@ -1,0 +1,17 @@
+{
+  "stages": {
+    "author": {
+      "status": "passed",
+      "at": "2026-07-19T15:09:49.764Z"
+    },
+    "audit": {
+      "status": "passed",
+      "at": "2026-07-19T15:42:49.839Z"
+    },
+    "gate": {
+      "status": "pending"
+    }
+  },
+  "implement": {},
+  "verify": {}
+}

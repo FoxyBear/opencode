@@ -1,0 +1,16 @@
+# Independent Adversarial Re-Audit — SDD-04 (Split Queue / Worker / Result Routing)
+
+**Target:** `docs/specs/260719_telegram_sdd-04-split-queue-worker-routing.md`
+**Role:** independent adversarial auditor (re-audit after revision; did not author the spec)
+**Date:** 2026-07-19
+**Prior verdict:** FAIL (B1 schema-ownership conflict, B2 ingestion loss window)
+
+VERDICT: PASS
+
+---
+
+## Summary
+
+Both prior BLOCKING issues are fully resolved and cross-checked against the master Shared Contract and SDD-01/02/03. B1: SDD-04 now asserts and the sibling specs now honor single ownership. SDD-04 (L9, L20/W-1a, L100, L133) declares the three tables EXACTLY ONCE in `src/queue/queue.sql.ts` + the single migration `20260719120000_telegram_queue`; `telegram_session.session_id`, `persona`, and `model_override` are all TEXT NULL (L104-106), matching master SC-1 (L109-116). SDD-01 (L58-60, L119) and SDD-02 (L8, L141) now explicitly issue NO `CREATE TABLE`/`ALTER TABLE` and drop their competing migrations, importing the table via `TelegramStore`/`Queue`; the double-add of `model_override` is gone and both specs agree on plain `TEXT NULL` (JSON-encoded, parsed by the data-access layer — no drizzle `{mode:json}` conflict). New V-13a statically asserts one `CREATE TABLE` and no stray `ALTER`/colliding timestamp. B2: `job_queue.ack_message_id` is now `integer NULL` (L117, matching SC-1 L118 / SC-3), and `Queue.ingestChatMessage` (L138, W-3) performs the inbox check-and-insert AND job insert inside ONE synchronous `Database.transaction({behavior:"immediate"})` with the explicit "no await inside" bun-sqlite constraint respected; ack `sendMessage` + `setAck` happen AFTER commit (W-7), and the delivery loop delivers a NULL-ack terminal job via a fresh `sendMessage` (W-17a, L169). New V-2a covers both crash-after-commit (job survives, delivered fresh) and crash-before-commit (Telegram redelivers).
+
+SC-2 holds: payload is `{prompt,persona?,timeoutMs?,sessionId?,model?}` uniformly across SDD-04 (L114), SC-2 (L124), SDD-01 (L101), SDD-02 (L90); the worker passes `sessionId`+`model` into `HeadlessSession.run` and `onSessionCreated` writes a NEW id to BOTH `job_queue.session_id` and `telegram_session.session_id` on creation only, not resume (W-12/W-12a, V-3a). Previously-sound parts survive: atomic claim (behavior:immediate, sync callback, `WHERE id=? AND status='pending'`), worker registered after `http`/`Runner.wire` with `hasRunner()` gate, durable delivery backbone + nudge, honest "suppress not kill" `/stop` with FOLLOW-UP-1, recovery sweep, per-chat exclusion now concrete (`claim(workerId, inFlightChatIds)` → `WHERE chat_id NOT IN`), and `/stop` chatId plumbing now specified as an explicit `ctx:{chatId?}` signature change. The two off-by-one anchors are fixed — verified against source: `_offset` at `bot.ts:55`, `max_concurrent_user_tasks:3` at `scheduler.ts:57`; `db.ts:155/157`, `headless.ts:12/27/31`, `serve.ts:138/151`, `api.ts:58`, `commands.ts:16/202` all resolve exactly. Prior advisories A1 (per-job delivery try/catch, L169), A2 (chatId ctx), A3 (in-flight list into claim) are also addressed. No new cross-spec inconsistency in payload shape, column names/nullability, or `TelegramStore.setSession`. Claim remains race-safe and worker order remains correct; no new blocking issue. PASS.

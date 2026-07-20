@@ -9,6 +9,7 @@
 #   make sdd author
 #   make sdd audit
 #   make sdd gate [yes]
+#   make sdd tests sdd-01
 #   make sdd implement sdd-01
 #   make sdd verify sdd-01
 #   make sdd reset

@@ -46,6 +46,14 @@ const SPECS: SpecDef[] = [
 
 const FEATURE_SPECS = SPECS.filter((s) => s.feature)
 
+// Independently-derived acceptance tests per spec. These are authored from the
+// spec's VERIFY section by an author who has NOT read the implementation, and
+// they gate `implement` (test-first). Path is relative to the package dir.
+const ACCEPTANCE_TEST_DIR = "test/telegram/verify"
+function acceptanceTestFile(spec: SpecDef): string {
+  return `${ACCEPTANCE_TEST_DIR}/${spec.id}.test.ts`
+}
+
 // Required section headers, checked case-insensitively as markdown headings.
 const FEATURE_SECTIONS = ["WHAT", "HOW", "VERIFY"]
 const MASTER_SECTIONS = ["Architecture", "Cross-Cutting", "Security", "Glossary", "Dependency"]
@@ -74,6 +82,10 @@ interface State {
     audit: { status: StageStatus; at?: string; detail?: string }
     gate: { status: "pending" | "approved"; at?: string; approvedBy?: string }
   }
+  // Independently-derived acceptance tests (test-first gate for implement).
+  // `retroactive: true` records the one-time case where the spec was
+  // implemented before its tests were authored (honesty flag, not a pass).
+  tests: Record<string, { status: StageStatus; at?: string; retroactive?: boolean }>
   implement: Record<string, { status: StageStatus; at?: string }>
   verify: Record<string, { status: StageStatus; at?: string }>
 }
@@ -85,6 +97,7 @@ function emptyState(): State {
       audit: { status: "pending" },
       gate: { status: "pending" },
     },
+    tests: {},
     implement: {},
     verify: {},
   }
@@ -93,7 +106,14 @@ function emptyState(): State {
 function loadState(): State {
   if (!existsSync(STATE_FILE)) return emptyState()
   try {
-    return JSON.parse(readFileSync(STATE_FILE, "utf-8")) as State
+    const parsed = JSON.parse(readFileSync(STATE_FILE, "utf-8")) as Partial<State>
+    const base = emptyState()
+    return {
+      stages: { ...base.stages, ...(parsed.stages ?? {}) },
+      tests: parsed.tests ?? {},
+      implement: parsed.implement ?? {},
+      verify: parsed.verify ?? {},
+    }
   } catch {
     return emptyState()
   }
@@ -205,13 +225,16 @@ function cmdStatus(): void {
   stageLine("audit", state.stages.audit.status)
   stageLine("gate", state.stages.gate.status)
 
-  console.log("\n  implement / verify (per spec):")
+  console.log("\n  tests / implement / verify (per spec):")
   for (const spec of FEATURE_SPECS) {
+    const tst = state.tests[spec.id]?.status ?? "pending"
     const impl = state.implement[spec.id]?.status ?? "pending"
     const ver = state.verify[spec.id]?.status ?? "pending"
-    const iMark = impl === "passed" ? OK : impl === "failed" ? NO : DASH
-    const vMark = ver === "passed" ? OK : ver === "failed" ? NO : DASH
-    console.log(`    ${spec.id}  impl ${iMark} ${impl.padEnd(8)}  verify ${vMark} ${ver}`)
+    const mark = (s: string) => (s === "passed" ? OK : s === "failed" ? NO : DASH)
+    const retro = state.tests[spec.id]?.retroactive ? " (retro)" : ""
+    console.log(
+      `    ${spec.id}  tests ${mark(tst)} ${(tst + retro).padEnd(16)} impl ${mark(impl)} ${impl.padEnd(8)} verify ${mark(ver)} ${ver}`,
+    )
   }
   console.log("")
 }
@@ -303,10 +326,69 @@ function resolveSpec(arg?: string): SpecDef {
   return spec
 }
 
+// Run `bun test` (optionally scoped to a path) and classify failures against the
+// known baseline. Returns whether it is green (no NEW failures and not a broken
+// run) plus the details for messaging.
+async function runBaselineTolerantTests(
+  pathArg?: string,
+): Promise<{ green: boolean; newFailures: string[]; tolerated: string[]; broken: boolean }> {
+  const test = pathArg
+    ? await $`bun test ${pathArg} --timeout 30000`.nothrow()
+    : await $`bun test --timeout 30000`.nothrow()
+  const output = test.stdout.toString() + "\n" + test.stderr.toString()
+  const failing = parseFailingTests(output)
+  const baseline = loadBaselineFailures()
+  const newFailures = failing.filter((name) => !baseline.has(name))
+  const tolerated = failing.filter((name) => baseline.has(name))
+  const broken = test.exitCode !== 0 && failing.length === 0
+  return { green: newFailures.length === 0 && !broken, newFailures, tolerated, broken }
+}
+
+async function cmdTests(arg?: string): Promise<void> {
+  const spec = resolveSpec(arg)
+  const state = loadState()
+  if (state.stages.gate.status !== "approved") die("tests blocked: human gate not approved. Run `make sdd gate` first.")
+
+  const testFile = acceptanceTestFile(spec)
+  const abs = join(process.cwd(), testFile)
+  console.log(`Checking independently-derived acceptance tests for ${spec.id}...\n`)
+  if (!existsSync(abs)) {
+    state.tests[spec.id] = { status: "failed", at: now() }
+    saveState(state)
+    die(`no acceptance test file at ${testFile}. Author it from the spec's VERIFY section (independent of the implementation) before implement.`)
+  }
+
+  // Honesty flag: if implementation already exists for this spec, the test-first
+  // ordering was corrected retroactively (tests derived after code). The stage
+  // still requires the tests to pass, but records that they were not red-first.
+  const retroactive = state.implement[spec.id]?.status === "passed"
+
+  console.log(`→ running ${testFile}`)
+  const r = await runBaselineTolerantTests(testFile)
+  if (r.broken) {
+    state.tests[spec.id] = { status: "failed", at: now(), retroactive }
+    saveState(state)
+    die(`acceptance test run for ${spec.id} broke (crash/compile error). Investigate.`)
+  }
+  if (!r.green) {
+    state.tests[spec.id] = { status: "failed", at: now(), retroactive }
+    saveState(state)
+    console.log("")
+    for (const f of r.newFailures) console.log(`    ${NO} failing: ${f}`)
+    die(`${r.newFailures.length} acceptance test(s) failing for ${spec.id}.`)
+  }
+  state.tests[spec.id] = { status: "passed", at: now(), retroactive }
+  saveState(state)
+  const note = retroactive ? " (RETROACTIVE: tests derived after implementation, not red-first)" : ""
+  pass(`acceptance tests for ${spec.id} pass${note}`)
+}
+
 async function cmdImplement(arg?: string): Promise<void> {
   const spec = resolveSpec(arg)
   const state = loadState()
   if (state.stages.gate.status !== "approved") die("implement blocked: human gate not approved. Run `make sdd gate` first.")
+  if (state.tests[spec.id]?.status !== "passed")
+    die(`implement blocked: acceptance tests for ${spec.id} have not passed. Run \`make sdd tests ${spec.id}\` first (test-first).`)
 
   console.log(`Validating implementation of ${spec.id} — typecheck + tests must be green.\n`)
 
@@ -320,27 +402,21 @@ async function cmdImplement(arg?: string): Promise<void> {
   pass("typecheck")
 
   console.log("→ tests")
-  const test = await $`bun test --timeout 30000`.nothrow()
-  const output = test.stdout.toString() + "\n" + test.stderr.toString()
-  const failing = parseFailingTests(output)
-  const baseline = loadBaselineFailures()
-  const newFailures = failing.filter((name) => !baseline.has(name))
-  if (newFailures.length > 0) {
+  const r = await runBaselineTolerantTests()
+  if (r.broken) {
+    state.implement[spec.id] = { status: "failed", at: now() }
+    saveState(state)
+    die(`test run broke with no parseable failures — investigate (crash/compile error in tests).`)
+  }
+  if (!r.green) {
     state.implement[spec.id] = { status: "failed", at: now() }
     saveState(state)
     console.log("")
-    for (const f of newFailures) console.log(`    ${NO} NEW failure: ${f}`)
-    die(`${newFailures.length} NEW test failure(s) — ${spec.id} implementation is not green. Never leave broken tests.`)
+    for (const f of r.newFailures) console.log(`    ${NO} NEW failure: ${f}`)
+    die(`${r.newFailures.length} NEW test failure(s) — ${spec.id} implementation is not green. Never leave broken tests.`)
   }
-  if (test.exitCode !== 0 && failing.length === 0) {
-    // Non-zero exit with no parseable (fail) lines means the run itself broke
-    // (compile error in a test, crash) — treat as failure.
-    state.implement[spec.id] = { status: "failed", at: now() }
-    saveState(state)
-    die(`test run exited ${test.exitCode} with no parseable failures — investigate (crash/compile error in tests).`)
-  }
-  const tolerated = failing.filter((name) => baseline.has(name))
-  if (tolerated.length > 0) pass(`tests (no new failures; ${tolerated.length} known pre-existing baseline failure(s) tolerated)`)
+  if (r.tolerated.length > 0)
+    pass(`tests (no new failures; ${r.tolerated.length} known pre-existing baseline failure(s) tolerated)`)
   else pass("tests")
 
   state.implement[spec.id] = { status: "passed", at: now() }
@@ -390,6 +466,9 @@ switch (stage) {
   case "gate":
     await cmdGate(arg)
     break
+  case "tests":
+    await cmdTests(arg)
+    break
   case "implement":
     await cmdImplement(arg)
     break
@@ -400,6 +479,6 @@ switch (stage) {
     cmdReset()
     break
   default:
-    console.log("usage: sdd <status|author|audit|gate|implement <spec>|verify <spec>|reset>")
+    console.log("usage: sdd <status|author|audit|gate|tests <spec>|implement <spec>|verify <spec>|reset>")
     process.exit(stage ? 1 : 0)
 }

@@ -7,13 +7,20 @@ export interface CommandResult {
   data?: Record<string, unknown>
 }
 
+// SDD-04 W-24: commands carry an explicit execution context bearing the
+// originating chat id, rather than resolving "the active session" from a
+// stateless registry (ambiguous under concurrent chats).
+export interface CommandContext {
+  chatId?: string
+}
+
 export interface HarnessCommand {
   name: string
   aliases?: string[]
   description: string
   category: "Mesh" | "Memory" | "Scheduler" | "System" | "AI"
   args?: string
-  execute: (args: string) => Promise<CommandResult>
+  execute: (args: string, ctx: CommandContext) => Promise<CommandResult>
 }
 
 interface Transport {
@@ -167,6 +174,18 @@ const commands: HarnessCommand[] = [
       }
     },
   },
+  {
+    name: "stop",
+    description: "Cancel the current job for this chat (cancels and stops replying; the underlying computation may finish in the background)",
+    category: "System",
+    async execute(_args, ctx) {
+      if (!ctx.chatId) return { text: "No chat context available for /stop." }
+      const { Queue } = await import("../queue/queue")
+      const count = Queue.requestCancel(ctx.chatId)
+      if (count === 0) return { text: "Nothing to cancel." }
+      return { text: "Cancelling. I will stop replying to that request; any work already running may finish in the background." }
+    },
+  },
 ]
 
 export namespace HarnessCommands {
@@ -199,11 +218,11 @@ export namespace HarnessCommands {
     return lines.join("\n")
   }
 
-  export async function execute(name: string, args: string): Promise<CommandResult | null> {
+  export async function execute(name: string, args: string, ctx: CommandContext = {}): Promise<CommandResult | null> {
     const cmd = find(name)
     if (!cmd) return null
     try {
-      return await cmd.execute(args)
+      return await cmd.execute(args, ctx)
     } catch (err) {
       log.error("harness command failed", { command: name, error: String(err) })
       return { text: `Error: ${err instanceof Error ? err.message : String(err)}` }

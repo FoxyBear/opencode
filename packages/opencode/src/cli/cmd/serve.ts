@@ -159,6 +159,21 @@ async function startDaemon(args: NetworkOptions & { background?: boolean }) {
           if (listener) await listener.stop(true)
         },
       },
+      {
+        // SDD-04: registered AFTER http so Runner.wire has run and
+        // HeadlessSession.hasRunner() is true. Non-fatal: a worker failure must
+        // not take down the daemon.
+        name: "queue-worker",
+        fatal: false,
+        async init() {
+          const { JobWorker } = await import("../../queue/worker")
+          await JobWorker.start({ cap: config?.scheduler?.max_concurrent_user_tasks })
+        },
+        async stop() {
+          const { JobWorker } = await import("../../queue/worker")
+          await JobWorker.stop()
+        },
+      },
     ],
   })
 

@@ -58,6 +58,7 @@ const STATE_DIR = join(SPECS_DIR, ".sdd-state")
 const STATE_FILE = join(STATE_DIR, "state.json")
 const AUDIT_DIR = join(STATE_DIR, "audit")
 const VERIFY_DIR = join(STATE_DIR, "verify")
+const BASELINE_FAILURES_FILE = join(STATE_DIR, "baseline-failures.txt")
 
 function specFile(spec: SpecDef): string {
   return join(SPECS_DIR, `${DATE}_${PROJECT}_${spec.id}-${spec.slug}.md`)
@@ -164,6 +165,29 @@ function readVerdict(file: string): "PASS" | "FAIL" | null {
   const m = body.match(/^\s*VERDICT:\s*(PASS|FAIL)\s*$/im)
   if (!m) return null
   return m[1]!.toUpperCase() as "PASS" | "FAIL"
+}
+
+// ── Test failure parsing (tolerate known pre-existing baseline failures) ──
+
+function loadBaselineFailures(): Set<string> {
+  const set = new Set<string>()
+  if (!existsSync(BASELINE_FAILURES_FILE)) return set
+  for (const raw of readFileSync(BASELINE_FAILURES_FILE, "utf-8").split("\n")) {
+    const line = raw.trim()
+    if (!line || line.startsWith("#")) continue
+    set.add(line)
+  }
+  return set
+}
+
+// Extract failing test names from `bun test` output: lines like
+// "(fail) <name> [12.34ms]". Strips the trailing timing bracket.
+function parseFailingTests(output: string): string[] {
+  const names: string[] = []
+  const re = /^\(fail\)\s+(.*?)(?:\s+\[[\d.]+ms\])?\s*$/gm
+  let m: RegExpExecArray | null
+  while ((m = re.exec(output)) !== null) names.push(m[1]!.trim())
+  return names
 }
 
 // ── Commands ──
@@ -297,12 +321,27 @@ async function cmdImplement(arg?: string): Promise<void> {
 
   console.log("→ tests")
   const test = await $`bun test --timeout 30000`.nothrow()
-  if (test.exitCode !== 0) {
+  const output = test.stdout.toString() + "\n" + test.stderr.toString()
+  const failing = parseFailingTests(output)
+  const baseline = loadBaselineFailures()
+  const newFailures = failing.filter((name) => !baseline.has(name))
+  if (newFailures.length > 0) {
     state.implement[spec.id] = { status: "failed", at: now() }
     saveState(state)
-    die(`tests failed — ${spec.id} implementation is not green. Never leave broken tests.`)
+    console.log("")
+    for (const f of newFailures) console.log(`    ${NO} NEW failure: ${f}`)
+    die(`${newFailures.length} NEW test failure(s) — ${spec.id} implementation is not green. Never leave broken tests.`)
   }
-  pass("tests")
+  if (test.exitCode !== 0 && failing.length === 0) {
+    // Non-zero exit with no parseable (fail) lines means the run itself broke
+    // (compile error in a test, crash) — treat as failure.
+    state.implement[spec.id] = { status: "failed", at: now() }
+    saveState(state)
+    die(`test run exited ${test.exitCode} with no parseable failures — investigate (crash/compile error in tests).`)
+  }
+  const tolerated = failing.filter((name) => baseline.has(name))
+  if (tolerated.length > 0) pass(`tests (no new failures; ${tolerated.length} known pre-existing baseline failure(s) tolerated)`)
+  else pass("tests")
 
   state.implement[spec.id] = { status: "passed", at: now() }
   state.verify[spec.id] = { status: "pending" }

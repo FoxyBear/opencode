@@ -1,4 +1,4 @@
-import { HeadlessSession, type HeadlessRunResult } from "./headless"
+import { HeadlessSession, type HeadlessRunResult, type RunModel } from "./headless"
 import { PersonaSession } from "../persona/session"
 import { Log } from "../util/log"
 import type { SessionID } from "../session/schema"
@@ -7,11 +7,15 @@ const log = Log.create({ service: "daemon.runner" })
 
 export namespace Runner {
   export interface SessionExecutor {
+    // SDD-04 SC-2: `sessionId`/`chatId`/`model` are additive/optional.
     execute(
       prompt: string,
       persona?: string,
       signal?: AbortSignal,
       onSessionCreated?: (sessionId: string) => void,
+      sessionId?: string,
+      chatId?: string,
+      model?: RunModel,
     ): Promise<HeadlessRunResult>
   }
 
@@ -22,10 +26,10 @@ export namespace Runner {
 
   export function wire(opts: WireOptions = {}): void {
     const executor = opts.executor ?? buildDefaultExecutor()
-    HeadlessSession.setRunner(async (prompt, persona, signal, onSessionCreated) => {
+    HeadlessSession.setRunner(async (prompt, persona, signal, onSessionCreated, sessionId, chatId, model) => {
       const effectivePersona = persona ?? (opts.getConfig ? await readConfigPersona(opts.getConfig) : undefined)
-      log.info("runner invoked", { persona: effectivePersona })
-      return executor.execute(prompt, effectivePersona, signal, onSessionCreated)
+      log.info("runner invoked", { persona: effectivePersona, resume: !!sessionId, override: !!model })
+      return executor.execute(prompt, effectivePersona, signal, onSessionCreated, sessionId, chatId, model)
     })
     log.info("headless runner wired")
   }
@@ -43,7 +47,11 @@ export namespace Runner {
 
   function buildDefaultExecutor(): SessionExecutor {
     return {
-      async execute(prompt, persona, _signal, onSessionCreated): Promise<HeadlessRunResult> {
+      // SDD-04: `_signal` is intentionally unused — the default executor does not
+      // cancel sdk.session.prompt today (W-26 / FOLLOW-UP-1). `resumeSessionId`
+      // resumes a chat's durable session (SDD-01); `overrideModel` is the chat
+      // model override (SDD-02), taking precedence over persona frontmatter.
+      async execute(prompt, persona, _signal, onSessionCreated, resumeSessionId, _chatId, overrideModel): Promise<HeadlessRunResult> {
         const start = Date.now()
         const { Server } = await import("../server/server")
         const { createOpencodeClient } = await import("@opencode-ai/sdk/v2")
@@ -70,14 +78,33 @@ export namespace Runner {
 
             const sdk = createOpencodeClient({ baseUrl: "http://foxybear.internal", fetch: fetchFn })
 
-            const title = prompt.slice(0, 50) + (prompt.length > 50 ? "..." : "")
-            const created = await sdk.session.create({ title })
-            const sessionID = created.data?.id
-            if (!sessionID) {
-              throw new Error("Failed to create session")
+            // SDD-04 SC-2: resume the chat's durable session when one was supplied
+            // and still exists (probe via session.messages); otherwise create a
+            // fresh session and fire onSessionCreated. onSessionCreated fires ONLY
+            // on creation, never on resume, so the worker's write-back is skipped
+            // for resumed sessions (W-12a).
+            let sessionID: string | undefined
+            if (resumeSessionId) {
+              try {
+                await sdk.session.messages({ sessionID: resumeSessionId } as any)
+                sessionID = resumeSessionId
+              } catch (err) {
+                log.info("resume session missing, creating new", {
+                  sessionID: resumeSessionId,
+                  error: String(err),
+                })
+              }
             }
 
-            onSessionCreated?.(sessionID)
+            if (!sessionID) {
+              const title = prompt.slice(0, 50) + (prompt.length > 50 ? "..." : "")
+              const created = await sdk.session.create({ title })
+              sessionID = created.data?.id
+              if (!sessionID) {
+                throw new Error("Failed to create session")
+              }
+              onSessionCreated?.(sessionID)
+            }
 
             if (resolvedPersona) {
               PersonaSession.attach(sessionID as SessionID, resolvedPersona)
@@ -88,7 +115,8 @@ export namespace Runner {
             }
 
             try {
-              const model = resolvedPersona?.model ? Provider.parseModel(resolvedPersona.model) : undefined
+              // Chat model override (SDD-02) wins over persona frontmatter.
+              const model = overrideModel ?? (resolvedPersona?.model ? Provider.parseModel(resolvedPersona.model) : undefined)
               const response = await sdk.session.prompt({
                 sessionID,
                 parts: [{ type: "text", text: prompt }],

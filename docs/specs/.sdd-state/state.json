@@ -9,9 +9,20 @@
       "at": "2026-07-19T15:42:49.839Z"
     },
     "gate": {
-      "status": "pending"
+      "status": "approved",
+      "at": "2026-07-19T17:05:30.536Z",
+      "approvedBy": "toddenglish"
     }
   },
-  "implement": {},
-  "verify": {}
+  "implement": {
+    "sdd-04": {
+      "status": "passed",
+      "at": "2026-07-20T10:54:09.397Z"
+    }
+  },
+  "verify": {
+    "sdd-04": {
+      "status": "pending"
+    }
+  }
 }

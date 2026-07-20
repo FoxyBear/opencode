@@ -9,11 +9,22 @@ export interface HeadlessRunResult {
   durationMs: number
 }
 
-type SessionRunner = (
+// SDD-04 SC-2: the run-chain carries optional resume + model context. These are
+// ADDITIVE/optional so existing callers keep compiling; SDD-01 consumes
+// `sessionId`, SDD-02 consumes `model`.
+export interface RunModel {
+  providerID: string
+  modelID: string
+}
+
+export type SessionRunner = (
   prompt: string,
   persona?: string,
   signal?: AbortSignal,
   onSessionCreated?: (sessionId: string) => void,
+  sessionId?: string,
+  chatId?: string,
+  model?: RunModel,
 ) => Promise<HeadlessRunResult>
 
 let _runner: SessionRunner | null = null
@@ -33,6 +44,9 @@ export namespace HeadlessSession {
     persona?: string
     timeoutMs?: number
     onSessionCreated?: (sessionId: string) => void
+    sessionId?: string
+    chatId?: string
+    model?: RunModel
   }): Promise<HeadlessRunResult> {
     if (!_runner) {
       throw new Error("Headless session runner not configured. Daemon may not be fully initialized.")
@@ -54,7 +68,15 @@ export namespace HeadlessSession {
 
     try {
       const result = await Promise.race([
-        _runner(input.prompt, input.persona, abort.signal, input.onSessionCreated),
+        _runner(
+          input.prompt,
+          input.persona,
+          abort.signal,
+          input.onSessionCreated,
+          input.sessionId,
+          input.chatId,
+          input.model,
+        ),
         timeoutPromise,
       ])
 

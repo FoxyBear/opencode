@@ -1,6 +1,16 @@
-import { getMe, getUpdates, sendMessage, sendMessageWithKeyboard, answerCallbackQuery, editMessageReplyMarkup } from "./api"
-import { HeadlessSession } from "../daemon/headless"
+import {
+  getMe,
+  getUpdates,
+  sendMessage,
+  sendMessageWithKeyboard,
+  answerCallbackQuery,
+  editMessageReplyMarkup,
+  editMessageText,
+} from "./api"
 import { HarnessCommands } from "../harness/commands"
+import { TelegramStore } from "./store"
+import { Queue } from "../queue/queue"
+import { JobWorker } from "../queue/worker"
 import { Log } from "../util/log"
 
 const log = Log.create({ service: "telegram" })
@@ -27,11 +37,11 @@ const DEFAULT_CONFIG: TelegramConfig = {
   max_response_length: 4096,
 }
 
+// Lean per-chat in-heap state. The durable session/correlation lives in
+// `telegram_session` / `job_queue` (CC-1); the only thing kept here is the
+// transient "awaiting a typed custom answer" flag for the question relay
+// (retained pending SDD-03's rewrite).
 interface ChatState {
-  lastSessionTime: number
-  lastSessionSummary?: string
-  processing: boolean
-  queue: Array<{ text: string; chatId: string; messageId: number }>
   awaitingCustomAnswer?: {
     questionRequestId: string
     questionIndex: number
@@ -48,6 +58,9 @@ interface PendingQuestion {
 const QUESTION_PREFIX = "q:"
 const CUSTOM_PREFIX = "qcustom:"
 
+const DELIVERY_INTERVAL_MS = 1500
+const PROGRESS_DEBOUNCE_MS = 3000
+
 export namespace TelegramBot {
   let _running = false
   let _config: TelegramConfig = { ...DEFAULT_CONFIG }
@@ -58,6 +71,8 @@ export namespace TelegramBot {
   let _sessionToChat = new Map<string, string>()
   let _pendingQuestions = new Map<string, PendingQuestion>()
   let _questionPollTimer: ReturnType<typeof setInterval> | null = null
+  let _deliveryTimer: ReturnType<typeof setInterval> | null = null
+  let _lastProgressEdit = new Map<string, number>()
 
   export async function start(config?: Partial<TelegramConfig>): Promise<void> {
     _config = { ...DEFAULT_CONFIG, ...config }
@@ -81,8 +96,18 @@ export namespace TelegramBot {
     _running = true
     _pollAbort = new AbortController()
 
-    // Start long-polling in background
+    // W-5: seed the poll offset durably from the inbox, not from lost memory.
+    _offset = Queue.derivePollOffset()
+
+    // The delivery loop is the durable backbone (W-20); the worker's nudge is a
+    // latency optimization layered on top.
+    JobWorker.setDeliveryHook(() => {
+      deliveryPass().catch((err) => log.warn("telegram: delivery pass error", { error: String(err) }))
+    })
+
+    // Start long-polling + delivery + question relay in background
     pollLoop()
+    startDeliveryLoop()
     startQuestionPoller()
   }
 
@@ -95,6 +120,11 @@ export namespace TelegramBot {
       clearInterval(_questionPollTimer)
       _questionPollTimer = null
     }
+    if (_deliveryTimer) {
+      clearInterval(_deliveryTimer)
+      _deliveryTimer = null
+    }
+    JobWorker.setDeliveryHook(null)
     log.info("telegram: bot stopped")
   }
 
@@ -131,11 +161,14 @@ export namespace TelegramBot {
       try {
         const updates = await getUpdates(_config.bot_token!, _offset, 30)
         for (const update of updates) {
+          // In-heap offset cache only; the durable inbox is the boot authority.
           _offset = update.update_id + 1
           if (update.callback_query) {
+            // Non-chat update: dedup without enqueuing (W-4).
+            if (!Queue.inboxCheckAndInsert(update.update_id)) continue
             await handleCallbackQuery(update.callback_query)
           } else if (update.message?.text) {
-            await handleMessage(update.message)
+            await handleMessage(update.message, update.update_id)
           }
         }
       } catch (err) {
@@ -147,7 +180,7 @@ export namespace TelegramBot {
     }
   }
 
-  async function handleMessage(message: any): Promise<void> {
+  async function handleMessage(message: any, updateId: number): Promise<void> {
     const chatId = String(message.chat.id)
     const text = message.text?.trim()
     if (!text) return
@@ -157,25 +190,31 @@ export namespace TelegramBot {
       return // Ignore silently
     }
 
-    // TG-14, TG-15: Handle harness commands via shared registry
+    // TG-14, TG-15: Handle harness commands via shared registry, before enqueue
+    // (W-24). Slash commands are handled inline and never become jobs.
     const cmd = text.split(/[\s@]/)[0]
     if (cmd.startsWith("/")) {
       const slashName = cmd.slice(1)
-      if (slashName === "help") {
-        await sendMessage(_config.bot_token!, chatId, HarnessCommands.helpText())
+      const known = slashName === "help" || !!HarnessCommands.find(slashName)
+      if (known) {
+        // Dedup the inline command before executing so a redelivered update
+        // cannot run it twice (e.g. /stop).
+        if (!Queue.inboxCheckAndInsert(updateId)) return
+        if (slashName === "help") {
+          await sendMessage(_config.bot_token!, chatId, HarnessCommands.helpText())
+          return
+        }
+        const result = await HarnessCommands.execute(slashName, text.slice(cmd.length).trim(), { chatId })
+        if (result) await sendMessage(_config.bot_token!, chatId, result.text)
         return
       }
-      const result = await HarnessCommands.execute(slashName, text.slice(cmd.length).trim())
-      if (result) {
-        await sendMessage(_config.bot_token!, chatId, result.text)
-        return
-      }
+      // Unknown slash command falls through to normal prompt handling.
     }
 
-    // Handle custom text answer for a pending question
+    // Handle custom text answer for a pending question (relay path, SDD-03 rewires)
     const state = getChatState(chatId)
-    log.info("telegram: handleMessage", { chatId, awaiting: !!state.awaitingCustomAnswer, processing: state.processing, textPreview: text.slice(0, 30) })
     if (state.awaitingCustomAnswer) {
+      if (!Queue.inboxCheckAndInsert(updateId)) return
       const { questionRequestId, questionIndex } = state.awaitingCustomAnswer
       state.awaitingCustomAnswer = undefined
       log.info("telegram: received custom answer", { chatId, questionRequestId, answer: text.slice(0, 50) })
@@ -183,97 +222,98 @@ export namespace TelegramBot {
       return
     }
 
-    // TG-09: Queue if chat already processing
-    if (state.processing) {
-      state.queue.push({ text, chatId, messageId: message.message_id })
-      log.info("telegram: message queued", { chatId, queueLength: state.queue.length })
-      return
-    }
-
-    await processMessage(chatId, text)
+    await processMessage(chatId, text, message.message_id, updateId)
   }
 
-  async function processMessage(chatId: string, text: string): Promise<void> {
-    const state = getChatState(chatId)
-    state.processing = true
+  // Ack-first ingestion (CC-4). The inbox check-and-insert AND the job insert
+  // commit atomically (SC-3); the ack is sent only AFTER that commit, then its
+  // id is stored (W-7). No inline HeadlessSession.run (W-8).
+  async function processMessage(chatId: string, text: string, messageId: number, updateId: number): Promise<void> {
+    const row = TelegramStore.getByChat(chatId)
+    const sessionId = row?.session_id ?? undefined
+    const model = TelegramStore.parseModel(row?.model_override)
+    const persona = row?.persona ?? _config.persona
 
+    const { enqueued, jobId } = Queue.ingestChatMessage(updateId, {
+      kind: "chat_message",
+      payload: {
+        prompt: text,
+        persona,
+        timeoutMs: _config.session_timeout_ms,
+        ...(sessionId ? { sessionId } : {}),
+        ...(model ? { model } : {}),
+      },
+      chat_id: chatId,
+      reply_to_message_id: messageId,
+    })
+
+    if (!enqueued || !jobId) return // duplicate update (W-4)
+
+    // AFTER commit: post the ack and record its id (W-7). If this throws, the
+    // job survives with ack_message_id NULL and the delivery loop uses a fresh
+    // sendMessage (W-7a / W-17a).
     try {
-      // TG-10, TG-11: Check session TTL for conversation continuity
-      const now = Date.now()
-      const withinTtl = state.lastSessionTime > 0 && (now - state.lastSessionTime) < _config.session_ttl_ms
-      let prompt = text
-      if (withinTtl && state.lastSessionSummary) {
-        prompt = `[Previous session context: ${state.lastSessionSummary}]\n\n${text}`
-      }
-
-      const progressTimer = startProgressFeedback(chatId)
-
-      let trackedSessionId: string | undefined
-      let result: Awaited<ReturnType<typeof HeadlessSession.run>>
-      try {
-        result = await HeadlessSession.run({
-          prompt,
-          persona: _config.persona,
-          timeoutMs: _config.session_timeout_ms,
-          onSessionCreated(sessionId) {
-            trackedSessionId = sessionId
-            _sessionToChat.set(sessionId, chatId)
-            log.info("telegram: session mapped to chat", { sessionId, chatId })
-          },
-        })
-      } finally {
-        clearInterval(progressTimer)
-        if (trackedSessionId) _sessionToChat.delete(trackedSessionId)
-      }
-
-      state.lastSessionTime = now
-      state.lastSessionSummary = result.response.slice(0, 500)
-
-      const maxLen = _config.max_response_length
-      const response = result.response.length > maxLen
-        ? result.response.slice(0, maxLen) + "\n\n_(truncated)_"
-        : result.response
-      await sendMessage(_config.bot_token!, chatId, response)
+      const sent = await sendMessage(_config.bot_token!, chatId, "⏳ Working on it...")
+      if (sent?.message_id) Queue.setAck(jobId, sent.message_id)
     } catch (err) {
-      // TG-08: Send error summary
-      const errMsg = String(err)
-      await sendMessage(_config.bot_token!, chatId, `Error: ${errMsg.slice(0, 200)}`)
-      log.error("telegram: session failed", { chatId, error: errMsg })
-    } finally {
-      state.processing = false
+      log.warn("telegram: ack send failed", { chatId, error: String(err) })
+    }
 
-      // Process queued messages
-      if (state.queue.length > 0) {
-        const next = state.queue.shift()!
-        await processMessage(next.chatId, next.text)
+    JobWorker.nudge()
+  }
+
+  function startDeliveryLoop(): void {
+    _deliveryTimer = setInterval(() => {
+      deliveryPass().catch((err) => log.warn("telegram: delivery pass error", { error: String(err) }))
+    }, DELIVERY_INTERVAL_MS)
+  }
+
+  // Table-driven delivery (CC-5). Delivers terminal results by editing the ack
+  // message, and reflects progress on non-terminal jobs, debounced (CC-7).
+  async function deliveryPass(): Promise<void> {
+    if (!_config.bot_token) return
+
+    // Terminal jobs: deliver once and mark delivered (W-17, W-17a, W-18, W-19).
+    for (const job of Queue.pendingDelivery()) {
+      try {
+        const formatted = formatTerminal(job)
+        if (job.ack_message_id != null) {
+          await editMessageText(_config.bot_token, job.chat_id, job.ack_message_id, formatted)
+        } else {
+          const sent = await sendMessage(_config.bot_token, job.chat_id, formatted)
+          if (sent?.message_id) Queue.setAck(job.id, sent.message_id)
+        }
+        Queue.markDelivered(job.id)
+      } catch (err) {
+        log.warn("telegram: delivery failed", { jobId: job.id, error: String(err) })
+      }
+    }
+
+    // Progress: edit the single ack message, debounced per chat (W-21..W-23).
+    for (const job of Queue.runningWithProgress()) {
+      const last = _lastProgressEdit.get(job.chat_id) ?? 0
+      if (Date.now() - last < PROGRESS_DEBOUNCE_MS) continue
+      try {
+        await editMessageText(_config.bot_token, job.chat_id, job.ack_message_id!, `⏳ ${job.progress}`)
+        _lastProgressEdit.set(job.chat_id, Date.now())
+      } catch (err) {
+        log.warn("telegram: progress edit failed", { jobId: job.id, error: String(err) })
       }
     }
   }
 
-  const PROGRESS_MESSAGES = [
-    "Still working on this...",
-    "Taking a bit longer than expected, but still on it.",
-    "Still here, still working.",
-    "Haven't forgotten about you — still processing.",
-    "This one's taking some time. Still on it.",
-  ]
-
-  function startProgressFeedback(chatId: string): ReturnType<typeof setInterval> {
-    let tick = 0
-    return setInterval(async () => {
-      const msg = PROGRESS_MESSAGES[tick % PROGRESS_MESSAGES.length]
-      try {
-        await sendMessage(_config.bot_token!, chatId, `⏳ ${msg}`)
-      } catch (err) {
-        log.warn("telegram: failed to send progress message", { chatId, error: String(err) })
-      }
-      tick++
-    }, _config.progress_interval_ms)
+  function formatTerminal(job: Queue.Job): string {
+    if (job.status === "canceled") return "Cancelled. I stopped replying to that request."
+    if (job.status === "error") return `Error: ${(job.error ?? "unknown error").slice(0, 200)}`
+    const response = job.result?.response ?? ""
+    if (!response) return "(empty response)"
+    const maxLen = _config.max_response_length
+    return response.length > maxLen ? response.slice(0, maxLen) + "\n\n_(truncated)_" : response
   }
 
   function getChatState(chatId: string): ChatState {
     if (!_chatStates.has(chatId)) {
-      _chatStates.set(chatId, { lastSessionTime: 0, processing: false, queue: [] })
+      _chatStates.set(chatId, {})
     }
     return _chatStates.get(chatId)!
   }
@@ -297,7 +337,9 @@ export namespace TelegramBot {
     for (const q of questions) {
       const qid = String(q.id)
       if (_pendingQuestions.has(qid)) continue
-      const chatId = _sessionToChat.get(String(q.sessionID))
+      // Resolve chat from the in-heap cache, falling back to the durable
+      // correlation the worker persisted (TelegramStore). SDD-03 rewires this.
+      const chatId = _sessionToChat.get(String(q.sessionID)) ?? TelegramStore.getBySession(String(q.sessionID))?.chat_id
       if (!chatId) continue
 
       const totalQ = q.questions.length
@@ -429,9 +471,15 @@ export namespace TelegramBot {
     _chatStates = new Map()
     _sessionToChat = new Map()
     _pendingQuestions = new Map()
+    _lastProgressEdit = new Map()
     if (_questionPollTimer) {
       clearInterval(_questionPollTimer)
       _questionPollTimer = null
     }
+    if (_deliveryTimer) {
+      clearInterval(_deliveryTimer)
+      _deliveryTimer = null
+    }
+    JobWorker.setDeliveryHook(null)
   }
 }

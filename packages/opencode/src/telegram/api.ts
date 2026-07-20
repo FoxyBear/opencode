@@ -69,6 +69,28 @@ export async function editMessageReplyMarkup(
   } catch {}
 }
 
+// SDD-04: edit an existing message's text (delivery loop / progress edits).
+// Swallow the harmless "message is not modified" error so idempotent re-edits
+// after a crash do not throw (W-19).
+export async function editMessageText(
+  token: string,
+  chatId: string,
+  messageId: number,
+  text: string,
+): Promise<void> {
+  try {
+    await telegramApi(token, "editMessageText", {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      parse_mode: "Markdown",
+    })
+  } catch (err) {
+    if (String(err).includes("message is not modified")) return
+    throw err
+  }
+}
+
 export async function answerCallbackQuery(token: string, callbackQueryId: string, text?: string): Promise<void> {
   await telegramApi(token, "answerCallbackQuery", {
     callback_query_id: callbackQueryId,

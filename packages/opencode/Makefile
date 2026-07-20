@@ -3,18 +3,17 @@
 # Convention: `make <command> <arg>`. One target per command; arguments are
 # parsed from MAKECMDGOALS, never split into per-variant targets.
 
-.PHONY: sdd
-# SDD pipeline — code-enforced Spec-Driven-Development gate.
+# The SDD pipeline is a generic, cross-project tool living at
+# FoxyBearOffice/development/sdd/. This target delegates to it, hardcoding this
+# project's workstream (--ws telegram), so from here you just run:
 #   make sdd status
-#   make sdd author
-#   make sdd audit
-#   make sdd gate [yes]
-#   make sdd tests sdd-01
-#   make sdd implement sdd-01
-#   make sdd verify sdd-01
-#   make sdd reset
+#   make sdd author | audit | gate
+#   make sdd tests sdd-01 | implement sdd-01 | verify sdd-01
+SDD_DRIVER := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))../../../../development/sdd/sdd.ts)
+
+.PHONY: sdd
 sdd:
-	@bun run script/sdd/sdd.ts $(filter-out sdd,$(MAKECMDGOALS))
+	@bun $(SDD_DRIVER) --ws telegram $(filter-out sdd,$(MAKECMDGOALS))
 
 # Swallow the argument words so make doesn't treat them as targets.
 %:

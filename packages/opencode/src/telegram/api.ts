@@ -101,6 +101,22 @@ export async function sendMessageWithKeyboard(
   })
 }
 
+// SDD-02 Amendment A: send an inline keyboard from explicit rows, so a picker can
+// place candidate buttons one-per-row and pack the Prev/Next controls onto a
+// single trailing row. Callers own row shaping; this only forwards it.
+export async function sendMessageWithButtonRows(
+  token: string,
+  chatId: string,
+  text: string,
+  rows: Array<Array<{ text: string; callback_data: string }>>,
+): Promise<any> {
+  return telegramApi(token, "sendMessage", {
+    chat_id: chatId,
+    text,
+    reply_markup: { inline_keyboard: rows },
+  })
+}
+
 export async function editMessageReplyMarkup(
   token: string,
   chatId: string,

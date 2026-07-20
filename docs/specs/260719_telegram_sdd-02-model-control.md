@@ -54,6 +54,17 @@ Behavioral requirements. `WHEN`/`SHALL` are literal tokens. Negative requirement
 14. WHEN a `/model` inline selection callback (`data` starting with `model:`) arrives, `handleCallbackQuery` SHALL parse the provider/model, re-check it against the persona policy, persist it as the per-chat override on success, and confirm; WHEN the selected model is forbidden, the system SHALL answer with an error and SHALL NOT change the stored override. `/model` SHALL be handled in the Telegram bot, not in `HarnessCommands`.
 15. WHEN a per-chat override is set, the system SHALL store it in `telegram_session.model_override` for that `chat_id` via `TelegramStore.setModel(chatId, model)`, and WHEN the override is cleared it SHALL store `null` via `TelegramStore.setModel(chatId, null)` (CC-1: durable, survives restart).
 
+### `/model` long-list picker (Amendment A, 2026-07-20)
+
+Motivation: a flat keyboard capped at 8 (requirement 12) cannot represent a provider with ~200 models. Amendment A replaces the no-arg flat cap with a search-first + recent picker that scales to any list size. Requirements 11-12 are SUPERSEDED for the no-arg presentation (policy filtering from 12 still applies); requirements 13-15 (exact-key set + persistence) are unchanged.
+
+- **A1** WHEN a chat sends `/model` with no argument, the system SHALL reply with the current effective model and an inline keyboard showing, in order: this chat's recently-selected allowed models (most-recent first), then allowed models ordered by `Provider.sort`, de-duplicated, capped to at most K (K = 8) buttons; and the reply text SHALL instruct the user to narrow via `/model <search>` or set exactly via `/model <providerID>/<modelID>`.
+- **A2** WHEN a chat sends `/model <query>` and `<query>` is NOT an exact existing allowed `providerID/modelID` key, the system SHALL treat `<query>` as a case-insensitive substring search over allowed model keys and reply with a paginated inline keyboard of the matches (at most K per page) plus Prev/Next controls when there is more than one page; WHEN there are no matches it SHALL reply that none were found. (The exact-key set path of requirement 13 takes precedence when `<query>` exactly matches an existing model.)
+- **A3** Because Telegram caps `callback_data` at 64 bytes (and a `providerID/modelID` key can exceed that), the picker SHALL NOT embed the full model key in `callback_data`. It SHALL reference a candidate by a short index token (e.g. `model:pick:<n>`) and Prev/Next by page token (e.g. `model:page:<n>`), resolving the token against per-chat picker state (the current search term, page, and ordered candidate keys). This state MAY be in-memory (reconstructable; not required to survive restart).
+- **A4** WHEN a candidate is selected by token, or a page control is tapped, the system SHALL resolve the token to a concrete model key, re-check it against the active persona policy (SEC-3 defense in depth), and on success persist it via `TelegramStore.setModel`; WHEN the token is stale/expired (no matching picker state) or the resolved model is forbidden, the system SHALL NOT change the override and SHALL reply with a clear message (e.g. ask the user to re-run `/model`).
+- **A5** The recent list, the suggested list, and the search results SHALL all exclude models forbidden for the active persona, so the Katya security boundary holds in every picker surface (consistent with SEC-1/SEC-3). A model can NEVER be offered or set through the picker if the persona policy denies it.
+- **A6** WHEN a chat successfully sets a model (by exact key, search selection, or suggested button), the system SHALL record it in that chat's recent-models list (most-recent first, de-duplicated, capped); this list backs A1's recent section and MAY be in-memory.
+
 ### Threading the override into execution
 
 16. WHEN a chat message is ingested, the system SHALL populate `payload.model` from that chat's `telegram_session.model_override` (parsed via `Provider.parseModel`); WHEN the Telegram worker executes that job, it SHALL forward `payload.model` through `HeadlessSession.run` → `SessionRunner` → `Runner.SessionExecutor.execute` → `sdk.session.prompt` (per SC-2), and SHALL NOT re-read `TelegramStore.getModel` at drain time.
@@ -194,5 +205,20 @@ Setup: persona with no `models` key and no frontmatter `model`. Action: run thro
 **V9 — `/status` reports session, model, persona (WHAT 19).**
 Setup: chat with a durable `telegram_session` row and an override set. Action: `/status`. Expected: reply contains the chat's `session_id`, the active model (the override), and the persona name; with no override, it reports the persona/default effective model.
 
-**V10 — build/regression (CC-9, WHAT 20).**
-Action: `bun run typecheck` (or `tsc --noEmit`) and `bun test` for the package. Expected: typecheck passes; the full suite is green, including the added persona-policy, executor-guard, and `/model`/`/status` tests. No pre-existing test is left red or removed to pass.
+**VA1 — no-arg picker shows recent + suggested, all allowed, capped (Amendment A1, A5).**
+Setup: Katya persona (deny anthropic/openai); a stub `Provider.list` with more than K allowed models plus some anthropic/openai; seed the chat's recent list with two allowed keys. Action: `/model`. Expected: `sendMessageWithKeyboard` called; the first buttons are the two recent keys (most-recent first), followed by `Provider.sort` order; total buttons ≤ K; no anthropic/openai button; reply text names the current model and mentions `/model <search>`.
+
+**VA2 — search filters and paginates (Amendment A2, A5).**
+Setup: allowed models including several whose key contains "llama" spanning more than K matches. Action: `/model llama`. Expected: a keyboard of matches whose keys all contain "llama" (case-insensitive), all policy-allowed (no denied family), at most K per page, with a Next control; a follow-up Next page token yields the remaining matches. A search with no matches replies "no models found". An exact existing allowed key (e.g. `/model deepinfra/x`) still SETS it (requirement 13 precedence), not a search.
+
+**VA3 — long model key selects via token, not raw callback_data (Amendment A3).**
+Setup: an allowed model whose `providerID/modelID` key exceeds 64 bytes. Action: render the picker, then tap its button. Expected: every button's `callback_data` is ≤ 64 bytes (a short `model:pick:<n>` / `model:page:<n>` token, NOT the full key); the tapped token resolves to the correct long key and it is set as the override. (A raw-key callback_data would exceed Telegram's limit and fail — this asserts the indirection.)
+
+**VA4 — stale/expired token and forbidden selection are safe (Amendment A4, A5).**
+Setup: picker state absent (simulating a restart or expiry). Action: a `model:pick:<n>` callback arrives. Expected: no override change; a clear reply asking to re-run `/model`; no throw. Second case: a token that resolves to a denied model (constructed) → re-check rejects it, override unchanged, error reply.
+
+**VA5 — successful set records recent (Amendment A6).**
+Setup: empty recent list. Action: set an allowed model via search selection, then send `/model`. Expected: the just-set model appears first in the recent section of the no-arg keyboard.
+
+**V10 — build/regression (CC-9, WHAT 20, Amendment A).**
+Action: `bun run typecheck` (or `tsc --noEmit`) and `bun test` for the package. Expected: typecheck passes; the full suite is green, including the added persona-policy, executor-guard, `/model`/`/status`, and the Amendment A picker tests. No pre-existing test is left red or removed to pass.

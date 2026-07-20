@@ -35,4 +35,18 @@ all-paths + field-path regression; V8 non-policy persona unaffected; V9 /status.
 
 The security-relevant behavior is fully covered. No implementation bug found.
 
-Note: RETROACTIVE — tests derived after implementation.
+## Amendment A (2026-07-20): /model search picker
+
+The flat 8-cap picker (found inadequate during the live smoke: a provider has
+~200 models) was replaced by a search-first + recent + paginated picker
+(requirements A1-A6, VERIFY VA1-VA5). Unlike the main suite, Amendment A was
+implemented GENUINELY test-first: the VA1-VA5 acceptance tests were written and
+run RED (6 failing: feature absent) BEFORE implementation, then GREEN (34 pass,
+0 fail). VA3 proves the Telegram 64-byte callback_data limit is respected — a
+>64-byte model key is selectable via a short `model:pick:<n>` token while every
+rendered callback_data is asserted <= 64 bytes (a latent bug the flat scheme
+would have hit). VA4/VA5/A5 confirm the Katya deny boundary holds across recent,
+suggested, and search surfaces, and a stale/forbidden token changes nothing.
+
+Note: RETROACTIVE flag applies to the ORIGINAL SDD-02 suite (tests after code).
+Amendment A was red-first.

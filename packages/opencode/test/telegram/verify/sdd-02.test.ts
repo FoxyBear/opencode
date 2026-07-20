@@ -38,6 +38,7 @@ import { Runner } from "../../../src/daemon/runner"
 import type { RunModel } from "../../../src/daemon/headless"
 import { TelegramHarness, purgeQueue } from "../harness"
 import { TelegramStore } from "../../../src/telegram/store"
+import { TelegramBot } from "../../../src/telegram/bot"
 
 // ---- fixtures --------------------------------------------------------------
 
@@ -57,6 +58,20 @@ const KATYA_MD = [
 
 // A persona with NO `models` frontmatter and NO `model` (non-policy control).
 const PLAIN_MD = ["---", "name: plainpersona", "---", "Plain."].join("\n")
+
+// A deny-only persona for the Amendment A picker tests: it keeps the Katya
+// security boundary (anthropic/openai denied) but has NO allow-list, so a diverse
+// catalog (deepinfra/llama-*, deepseek/*, etc.) is allowed and can be searched,
+// paginated, and long-key-tested. All VA harness tests run against this persona.
+const PICKER_MD = [
+  "---",
+  "name: pickerpersona",
+  "model: deepseek/deepseek-chat",
+  "models:",
+  '  deny: ["anthropic/*", "openai/*"]',
+  "---",
+  "I am the picker persona.",
+].join("\n")
 
 async function writePersonaFile(name: string, body: string): Promise<void> {
   const dir = path.join(Global.Path.config, "personas")
@@ -108,6 +123,7 @@ function chatId(tag: string): string {
 beforeAll(async () => {
   await writePersonaFile("katya", KATYA_MD)
   await writePersonaFile("plainpersona", PLAIN_MD)
+  await writePersonaFile("pickerpersona", PICKER_MD)
 })
 
 beforeEach(() => {
@@ -524,6 +540,222 @@ describe("V3 — /model keyboard excludes forbidden families (WHAT 11-12, SEC-3)
   // The filtering LOGIC is covered above and by V2; the SEC-1 executor guard
   // (which stands even if a forbidden button ever slipped through) is covered by V7.
   test.todo("V3 end-to-end keyboard content/order/cap — needs configured providers (Provider.list empty in headless env)", () => {})
+})
+
+// ============================================================================
+// Amendment A picker tests (VA1..VA5). All run against the deny-only
+// "pickerpersona" fixture (anthropic/openai denied, everything else allowed) so
+// the Katya boundary holds while a diverse catalog can be searched/paginated.
+// The provider catalog is injected via the TelegramBot.__setModelCatalog test
+// seam (test/preload.ts strips provider keys, so real Provider.list is empty in
+// the headless env). Keys returned by the stub are already in Provider.sort order.
+// ============================================================================
+
+// ============================================================================
+// VA1 — no-arg picker shows recent + suggested, all allowed, capped (A1, A5).
+// ============================================================================
+describe("VA1 — no-arg picker: recent-then-sorted, policy-filtered, capped (Amendment A1, A5)", () => {
+  test("recent keys lead (most-recent first), then Provider.sort order, no denied families, <= K", async () => {
+    purgeQueue()
+    const h = new TelegramHarness({ persona: "pickerpersona", allowedChatIds: [] })
+    await h.start()
+    h.setEchoRunner("ok")
+    const chat = chatId("va1")
+    // Sorted catalog (Provider.sort order) with more than K allowed + 2 denied.
+    const sorted = [
+      "deepseek/a",
+      "deepseek/b",
+      "deepseek/c",
+      "deepseek/d",
+      "deepseek/e",
+      "deepseek/f",
+      "deepseek/g",
+      "deepseek/h",
+      "deepseek/i",
+      "anthropic/claude-x",
+      "openai/gpt-5",
+    ]
+    TelegramBot.__setModelCatalog(async () => ({ keys: sorted, default: "deepseek/deepseek-chat" }))
+    // Seed recent, most-recent first.
+    TelegramBot.__seedRecent(chat, ["deepseek/f", "deepseek/c"])
+
+    const before = h.keyboardSends().length
+    h.injectMessage(chat, "/model")
+    await h.waitFor(() => h.keyboardSends().length > before, 5000)
+
+    const buttons = h.lastKeyboard()
+    const picks = buttons.filter((b) => b.callback_data.startsWith("model:pick:"))
+    // Recent keys lead, most-recent first.
+    expect(picks[0]?.text).toBe("deepseek/f")
+    expect(picks[1]?.text).toBe("deepseek/c")
+    // At most K buttons.
+    expect(picks.length).toBeLessThanOrEqual(8)
+    // No denied family is ever offered (A5, SEC-3).
+    expect(picks.every((b) => !b.text.startsWith("anthropic/") && !b.text.startsWith("openai/"))).toBe(true)
+    // Reply names the current effective model and instructs the search form.
+    const text = h.keyboardSends().at(-1)?.body?.text ?? ""
+    expect(text).toContain("deepseek/deepseek-chat")
+    expect(text).toContain("/model <search>")
+    await h.stop()
+  })
+})
+
+// ============================================================================
+// VA2 — search filters, paginates, and exact-key set takes precedence (A2, A5).
+// ============================================================================
+describe("VA2 — search + paginate + exact-key precedence (Amendment A2, A5)", () => {
+  test("substring search paginates matches, drops denied, Next yields the rest; exact key still SETS", async () => {
+    purgeQueue()
+    const h = new TelegramHarness({ persona: "pickerpersona", allowedChatIds: [] })
+    await h.start()
+    h.setEchoRunner("ok")
+    const chat = chatId("va2")
+    const llamas = Array.from({ length: 11 }, (_, i) => `deepinfra/llama-${i}`)
+    // A denied entry that ALSO matches "llama": must be filtered out by policy.
+    const catalog = [...llamas, "deepseek/deepseek-chat", "anthropic/llama-decoy"]
+    TelegramBot.__setModelCatalog(async () => ({ keys: catalog, default: "deepseek/deepseek-chat" }))
+
+    // Page 0 of the search.
+    let before = h.keyboardSends().length
+    h.injectMessage(chat, "/model llama")
+    await h.waitFor(() => h.keyboardSends().length > before, 5000)
+    let buttons = h.lastKeyboard()
+    let picks = buttons.filter((b) => b.callback_data.startsWith("model:pick:"))
+    expect(picks.length).toBeLessThanOrEqual(8)
+    expect(picks.length).toBeGreaterThan(0)
+    // Every match contains "llama" (case-insensitive) and none is a denied family.
+    expect(picks.every((b) => b.text.toLowerCase().includes("llama"))).toBe(true)
+    expect(picks.every((b) => !b.text.startsWith("anthropic/"))).toBe(true)
+    // More than one page => a Next control exists.
+    expect(buttons.some((b) => b.callback_data === "model:page:1")).toBe(true)
+
+    // Page 1 yields the remaining matches (11 - 8 = 3).
+    before = h.keyboardSends().length
+    h.injectCallback(chat, "model:page:1")
+    await h.waitFor(() => h.keyboardSends().length > before, 5000)
+    buttons = h.lastKeyboard()
+    picks = buttons.filter((b) => b.callback_data.startsWith("model:pick:"))
+    expect(picks.length).toBe(3)
+
+    // A search with no matches replies "no models found".
+    before = h.sends().length
+    h.injectMessage(chat, "/model zzzz-nope")
+    await h.waitFor(() => h.sends().length > before, 5000)
+    expect((h.sends().at(-1)?.body?.text ?? "").toLowerCase()).toContain("no models found")
+
+    // An exact existing allowed key SETS it (requirement 13 precedence, not a search).
+    h.injectMessage(chat, "/model deepseek/deepseek-chat")
+    await h.waitFor(() => TelegramStore.getModel(chat) !== undefined, 5000)
+    expect(TelegramStore.getModel(chat)).toEqual({ providerID: "deepseek", modelID: "deepseek-chat" })
+    await h.stop()
+  })
+})
+
+// ============================================================================
+// VA3 — a >64-byte key is selectable via a short token, NOT raw callback_data (A3).
+// ============================================================================
+describe("VA3 — long key selects via short token; every callback_data <= 64 bytes (Amendment A3)", () => {
+  test("keyboard callback_data stays within 64 bytes and the tapped token resolves the long key", async () => {
+    purgeQueue()
+    const h = new TelegramHarness({ persona: "pickerpersona", allowedChatIds: [] })
+    await h.start()
+    h.setEchoRunner("ok")
+    const chat = chatId("va3")
+    const longId = "super-long-model-identifier-that-definitely-exceeds-sixty-four-bytes-in-total-length"
+    const longKey = `deepinfra/${longId}`
+    // Precondition: the underlying key really is longer than Telegram's limit.
+    expect(Buffer.byteLength(longKey, "utf8")).toBeGreaterThan(64)
+    TelegramBot.__setModelCatalog(async () => ({ keys: [longKey, "deepseek/deepseek-chat"], default: "deepseek/deepseek-chat" }))
+
+    const before = h.keyboardSends().length
+    h.injectMessage(chat, "/model")
+    await h.waitFor(() => h.keyboardSends().length > before, 5000)
+    const buttons = h.lastKeyboard()
+
+    // A3 hard requirement: EVERY button's callback_data is <= 64 bytes.
+    for (const b of buttons) {
+      expect(Buffer.byteLength(b.callback_data, "utf8")).toBeLessThanOrEqual(64)
+    }
+    // The long key is offered as a button whose callback_data is a short pick token.
+    const longBtn = buttons.find((b) => b.text === longKey)
+    expect(longBtn).toBeDefined()
+    expect(longBtn!.callback_data.startsWith("model:pick:")).toBe(true)
+
+    // Tapping the token resolves to the concrete long key and sets it.
+    h.injectCallback(chat, longBtn!.callback_data)
+    await h.waitFor(() => TelegramStore.getModel(chat) !== undefined, 5000)
+    expect(TelegramStore.getModel(chat)).toEqual({ providerID: "deepinfra", modelID: longId })
+    await h.stop()
+  })
+})
+
+// ============================================================================
+// VA4 — stale/expired token and a forbidden resolved model are both safe (A4, A5).
+// ============================================================================
+describe("VA4 — stale token + forbidden token safety (Amendment A4, A5)", () => {
+  test("(a) a pick token with NO picker state changes nothing and asks to re-run /model (no throw)", async () => {
+    purgeQueue()
+    const h = new TelegramHarness({ persona: "pickerpersona", allowedChatIds: [] })
+    await h.start()
+    h.setEchoRunner("ok")
+    const chat = chatId("va4a")
+    const before = h.sends().length
+    h.injectCallback(chat, "model:pick:0") // no picker state seeded => stale
+    await h.waitFor(() => h.sends().length > before, 5000)
+    expect(TelegramStore.getModel(chat)).toBeUndefined()
+    expect((h.sends().at(-1)?.body?.text ?? "").toLowerCase()).toContain("re-run")
+    await h.stop()
+  })
+
+  test("(b) a token resolving to a DENIED model is re-checked and rejected; override unchanged", async () => {
+    purgeQueue()
+    const h = new TelegramHarness({ persona: "pickerpersona", allowedChatIds: [] })
+    await h.start()
+    h.setEchoRunner("ok")
+    const chat = chatId("va4b")
+    // Seed picker state with a denied candidate directly (A5 keeps it out of the
+    // real picker; this proves the A4 selection-time re-check is a real second gate).
+    TelegramBot.__seedPicker(chat, { term: "", page: 0, candidates: ["anthropic/claude-sonnet-4-5"] })
+    const before = h.sends().length
+    h.injectCallback(chat, "model:pick:0")
+    await h.waitFor(() => h.sends().length > before, 5000)
+    expect(TelegramStore.getModel(chat)).toBeUndefined()
+    expect((h.sends().at(-1)?.body?.text ?? "").toLowerCase()).toContain("not allowed")
+    await h.stop()
+  })
+})
+
+// ============================================================================
+// VA5 — a successful set records the model in the chat's recent list (A6).
+// ============================================================================
+describe("VA5 — successful set records recent, surfaced first in the no-arg picker (Amendment A6)", () => {
+  test("setting via search selection puts the model first in the next no-arg keyboard", async () => {
+    purgeQueue()
+    const h = new TelegramHarness({ persona: "pickerpersona", allowedChatIds: [] })
+    await h.start()
+    h.setEchoRunner("ok")
+    const chat = chatId("va5")
+    const keys = ["deepinfra/llama-a", "deepinfra/llama-b", "deepseek/deepseek-chat"]
+    TelegramBot.__setModelCatalog(async () => ({ keys, default: "deepseek/deepseek-chat" }))
+
+    // Search then select llama-b.
+    let before = h.keyboardSends().length
+    h.injectMessage(chat, "/model llama-b")
+    await h.waitFor(() => h.keyboardSends().length > before, 5000)
+    const btn = h.lastKeyboard().find((b) => b.text === "deepinfra/llama-b")
+    expect(btn).toBeDefined()
+    h.injectCallback(chat, btn!.callback_data)
+    await h.waitFor(() => TelegramStore.getModel(chat) !== undefined, 5000)
+    expect(TelegramStore.getModel(chat)).toEqual({ providerID: "deepinfra", modelID: "llama-b" })
+
+    // The no-arg picker now leads with the just-set model.
+    before = h.keyboardSends().length
+    h.injectMessage(chat, "/model")
+    await h.waitFor(() => h.keyboardSends().length > before, 5000)
+    const picks = h.lastKeyboard().filter((b) => b.callback_data.startsWith("model:pick:"))
+    expect(picks[0]?.text).toBe("deepinfra/llama-b")
+    await h.stop()
+  })
 })
 
 // ============================================================================

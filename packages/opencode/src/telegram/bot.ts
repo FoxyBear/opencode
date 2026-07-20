@@ -3,6 +3,7 @@ import {
   getUpdates,
   sendMessage,
   sendMessageWithKeyboard,
+  sendMessageWithButtonRows,
   answerCallbackQuery,
   editMessageReplyMarkup,
   editMessageText,
@@ -65,9 +66,32 @@ const QUESTION_PREFIX = "q:"
 const CUSTOM_PREFIX = "qcustom:"
 // SDD-02: inline-keyboard callback for a `/model` selection.
 const MODEL_PREFIX = "model:"
-// SDD-02: cap the `/model` keyboard — sendMessageWithKeyboard renders one button
-// per row, so an unbounded list would flood the chat.
+// SDD-02 Amendment A: short callback tokens. Telegram caps callback_data at 64
+// bytes and a `providerID/modelID` key can exceed that, so the picker never
+// embeds the key — it references a candidate by index (`model:pick:<n>`) and a
+// page by number (`model:page:<n>`), resolved against per-chat picker state (A3).
+const MODEL_PICK_TOKEN = "pick:"
+const MODEL_PAGE_TOKEN = "page:"
+// SDD-02 Amendment A (A1/A2): K buttons per picker page (was the flat-keyboard cap).
 const MODEL_KEYBOARD_CAP = 8
+// SDD-02 Amendment A (A6): cap on the per-chat recent-models list.
+const RECENT_CAP = 5
+
+// SDD-02 Amendment A (A3): per-chat picker state so short tokens resolve to a
+// concrete model key and Prev/Next can be rendered. In-memory and reconstructable
+// (a stale token after a restart is handled by re-running `/model`, A4).
+interface PickerState {
+  term: string
+  page: number
+  candidates: string[]
+}
+
+// A test seam mirroring `Provider.list` + `Provider.defaultModel`: returns all
+// model keys already in `Provider.sort` order plus the concrete default key. The
+// headless test env strips provider API keys (Provider.list is empty there), so
+// picker tests inject a catalog here; production resolves the real one.
+type ModelCatalog = { keys: string[]; default: string }
+type ModelCatalogSource = () => Promise<ModelCatalog>
 
 const DELIVERY_INTERVAL_MS = 1500
 const PROGRESS_DEBOUNCE_MS = 3000
@@ -95,6 +119,11 @@ export namespace TelegramBot {
   let _questionUnsub: (() => void) | null = null
   let _deliveryTimer: ReturnType<typeof setInterval> | null = null
   let _lastProgressEdit = new Map<string, number>()
+  // SDD-02 Amendment A: per-chat picker state (A3) and recent-models list (A6).
+  let _pickerStates = new Map<string, PickerState>()
+  let _recentModels = new Map<string, string[]>()
+  // Test seam: inject the provider catalog (see ModelCatalogSource above).
+  let _modelCatalogOverride: ModelCatalogSource | null = null
 
   export async function start(config?: Partial<TelegramConfig>): Promise<void> {
     _config = { ...DEFAULT_CONFIG, ...config }
@@ -377,11 +406,15 @@ export namespace TelegramBot {
     return `${model.providerID}/${model.modelID}`
   }
 
-  // SDD-02 req 11-13, SEC-3: `/model` shows the current effective model + an
-  // inline keyboard of ALLOWED models (no arg), or sets a per-chat override
-  // (with arg). The persona policy is the filter/gate here (defense in depth
-  // over the SEC-1 executor guard). Any inability to load the policy fails
-  // closed: the model is left unchanged.
+  // SDD-02 req 13 + Amendment A (A1/A2), SEC-3: `/model`.
+  //  - no arg  -> the current effective model + a picker keyboard of this chat's
+  //    recent allowed models (most-recent first) then Provider.sort order,
+  //    de-duplicated and capped to K (A1).
+  //  - <arg> that exactly matches an existing allowed key -> SET it (req 13).
+  //  - <arg> otherwise -> case-insensitive substring search over allowed keys,
+  //    rendered as a paginated picker (A2).
+  // The persona policy is the filter/gate here (defense in depth over the SEC-1
+  // executor guard). Any inability to load the policy fails closed (unchanged).
   async function handleModel(chatId: string, args: string): Promise<void> {
     const arg = args.trim()
     const persona = personaForChat(chatId)
@@ -397,77 +430,114 @@ export namespace TelegramBot {
     }
     const policy = config.models
 
-    if (arg) {
-      // Set path (req 13): parse -> exists? -> allowed? -> persist override.
-      try {
-        const { exists, key } = await checkModel(arg)
-        if (!exists) {
-          await sendMessage(_config.bot_token!, chatId, `Unknown model: ${arg}. It is not available on any configured provider.`)
-          return
-        }
-        if (!PersonaPolicy.isModelAllowed(policy, key)) {
-          await sendMessage(_config.bot_token!, chatId, `Model ${key} is not allowed for persona "${persona}".`)
-          return
-        }
-        TelegramStore.setModel(chatId, key)
-        await sendMessage(_config.bot_token!, chatId, `Model set to ${key} for this chat.`)
-      } catch (err) {
-        log.warn("telegram: /model set failed", { chatId, arg, error: String(err) })
-        await sendMessage(_config.bot_token!, chatId, "Could not set the model. Please try again.")
-      }
+    let catalog: ModelCatalog
+    try {
+      catalog = await getModelCatalog()
+    } catch (err) {
+      log.warn("telegram: /model could not list providers", { chatId, error: String(err) })
+      await sendMessage(_config.bot_token!, chatId, "Could not list models. Please try again.")
       return
     }
 
-    // List path (req 11-12): current effective model + allowed keyboard.
-    try {
-      const { candidates, def } = await listAllowedModels(policy)
-      const effective = override ? modelKey(override) : config.model ?? def
-      const buttons = candidates.map((key) => ({ text: key, callback_data: `${MODEL_PREFIX}${key}` }))
-      const text = `Current model: ${effective}`
-      if (buttons.length > 0) {
-        await sendMessageWithKeyboard(_config.bot_token!, chatId, `${text}\n\nSelect a model:`, buttons)
-      } else {
-        await sendMessage(_config.bot_token!, chatId, `${text}\n\n(no selectable models available for this persona)`)
+    if (arg) {
+      // Exact-key precedence (req 13): an existing key SETS it, allowed or an
+      // explicit rejection — it is never reinterpreted as a search term.
+      if (catalog.keys.includes(arg)) {
+        if (!PersonaPolicy.isModelAllowed(policy, arg)) {
+          await sendMessage(_config.bot_token!, chatId, `Model ${arg} is not allowed for persona "${persona}".`)
+          return
+        }
+        TelegramStore.setModel(chatId, arg)
+        recordRecent(chatId, arg)
+        await sendMessage(_config.bot_token!, chatId, `Model set to ${arg} for this chat.`)
+        return
       }
-    } catch (err) {
-      log.warn("telegram: /model list failed", { chatId, error: String(err) })
-      await sendMessage(_config.bot_token!, chatId, "Could not list models. Please try again.")
+
+      // Search path (A2): case-insensitive substring over allowed keys.
+      const matches = searchModels(catalog.keys, arg, policy)
+      if (matches.length === 0) {
+        await sendMessage(_config.bot_token!, chatId, `No models found matching "${arg}".`)
+        return
+      }
+      _pickerStates.set(chatId, { term: arg, page: 0, candidates: matches })
+      await sendPickerPage(chatId, 0, `Models matching "${arg}":`)
+      return
+    }
+
+    // No-arg picker (A1): recent-then-sorted, policy-filtered, capped to K.
+    const suggested = suggestModels(catalog.keys, getRecent(chatId), policy)
+    _pickerStates.set(chatId, { term: "", page: 0, candidates: suggested })
+    const effective = override ? modelKey(override) : config.model ?? catalog.default
+    const header =
+      `Current model: ${effective}\n\n` +
+      "Pick one below, narrow with /model <search>, or set exactly with /model <providerID>/<modelID>."
+    if (suggested.length > 0) {
+      await sendPickerPage(chatId, 0, header)
+    } else {
+      await sendMessage(_config.bot_token!, chatId, `${header}\n\n(no selectable models available for this persona)`)
     }
   }
 
-  // Validate a `provider/model` string exists on some configured provider,
-  // reusing Provider.parseModel + Provider.getModel (req 13). Returns the parsed
-  // key so the caller can reuse it.
-  async function checkModel(arg: string): Promise<{ exists: boolean; key: string }> {
-    const { Provider } = await import("../provider/provider")
-    const { Instance } = await import("../project/instance")
-    const { InstanceBootstrap } = await import("../project/bootstrap")
-    const { AppRuntime } = await import("../effect/app-runtime")
-    const { Effect } = await import("effect")
-    return Instance.provide({
-      directory: process.cwd(),
-      init: () => AppRuntime.runPromise(InstanceBootstrap),
-      async fn() {
-        const parsed = Provider.parseModel(arg)
-        const key = `${parsed.providerID}/${parsed.modelID}`
-        const exists = await AppRuntime.runPromise(
-          Effect.gen(function* () {
-            const svc = yield* Provider.Service
-            yield* svc.getModel(parsed.providerID, parsed.modelID)
-            return true
-          }),
-        ).catch(() => false)
-        return { exists, key }
-      },
-    })
+  // A1: recent allowed keys (most-recent first) then Provider.sort order,
+  // de-duplicated, capped to K. All sections are policy-filtered (A5).
+  function suggestModels(
+    sortedKeys: string[],
+    recent: string[],
+    policy: PersonaPolicy.ModelPolicy | undefined,
+  ): string[] {
+    const allowed = (k: string) => PersonaPolicy.isModelAllowed(policy, k)
+    const ordered = [...recent.filter(allowed), ...sortedKeys.filter(allowed)]
+    const seen = new Set<string>()
+    const deduped: string[] = []
+    for (const k of ordered) {
+      if (seen.has(k)) continue
+      seen.add(k)
+      deduped.push(k)
+    }
+    return deduped.slice(0, MODEL_KEYBOARD_CAP)
   }
 
-  // Enumerate provider models, filter through the persona policy (req 12),
-  // order via Provider.sort, and cap to MODEL_KEYBOARD_CAP. Also returns the
-  // concrete default model key for the current-model display.
-  async function listAllowedModels(
+  // A2/A5: case-insensitive substring search over allowed keys (not capped here;
+  // sendPickerPage paginates K per page).
+  function searchModels(
+    sortedKeys: string[],
+    term: string,
     policy: PersonaPolicy.ModelPolicy | undefined,
-  ): Promise<{ candidates: string[]; def: string }> {
+  ): string[] {
+    const needle = term.toLowerCase()
+    return sortedKeys.filter((k) => PersonaPolicy.isModelAllowed(policy, k) && k.toLowerCase().includes(needle))
+  }
+
+  // A3: render one page of the chat's picker state. Candidate buttons carry a
+  // short `model:pick:<globalIndex>` token (NEVER the full key), one per row;
+  // Prev/Next controls (`model:page:<n>`) share a trailing row when there is more
+  // than one page. Updates the stored page so a later Prev/Next is correct.
+  async function sendPickerPage(chatId: string, page: number, text: string): Promise<void> {
+    const state = _pickerStates.get(chatId)
+    if (!state) return
+    const total = state.candidates.length
+    const clamped = Math.max(0, Math.min(page, Math.max(0, Math.ceil(total / MODEL_KEYBOARD_CAP) - 1)))
+    const start = clamped * MODEL_KEYBOARD_CAP
+    const pageKeys = state.candidates.slice(start, start + MODEL_KEYBOARD_CAP)
+    state.page = clamped
+
+    const rows: Array<Array<{ text: string; callback_data: string }>> = pageKeys.map((key, i) => [
+      { text: key, callback_data: `${MODEL_PREFIX}${MODEL_PICK_TOKEN}${start + i}` },
+    ])
+    const controls: Array<{ text: string; callback_data: string }> = []
+    if (clamped > 0) controls.push({ text: "◀ Prev", callback_data: `${MODEL_PREFIX}${MODEL_PAGE_TOKEN}${clamped - 1}` })
+    if (start + MODEL_KEYBOARD_CAP < total)
+      controls.push({ text: "Next ▶", callback_data: `${MODEL_PREFIX}${MODEL_PAGE_TOKEN}${clamped + 1}` })
+    if (controls.length > 0) rows.push(controls)
+
+    await sendMessageWithButtonRows(_config.bot_token!, chatId, text, rows)
+  }
+
+  // Resolve the provider catalog: keys already in Provider.sort order plus the
+  // concrete default key. Uses the test seam when set (headless env has no
+  // configured providers), otherwise reads the real Provider service.
+  async function getModelCatalog(): Promise<ModelCatalog> {
+    if (_modelCatalogOverride) return _modelCatalogOverride()
     const { Provider } = await import("../provider/provider")
     const { Instance } = await import("../project/instance")
     const { InstanceBootstrap } = await import("../project/bootstrap")
@@ -487,18 +557,27 @@ export namespace TelegramBot {
         const models: any[] = []
         for (const [pid, prov] of Object.entries(providers)) {
           for (const model of Object.values((prov as any).models)) {
-            const key = `${pid}/${(model as any).id}`
-            if (PersonaPolicy.isModelAllowed(policy, key)) {
-              pidByModel.set(model, pid)
-              models.push(model)
-            }
+            pidByModel.set(model, pid)
+            models.push(model)
           }
         }
-        const sorted = Provider.sort(models).slice(0, MODEL_KEYBOARD_CAP)
-        const candidates = sorted.map((m: any) => `${pidByModel.get(m)}/${m.id}`)
-        return { candidates, def: `${def.providerID}/${def.modelID}` }
+        const sorted = Provider.sort(models)
+        const keys = sorted.map((m: any) => `${pidByModel.get(m)}/${m.id}`)
+        return { keys, default: `${def.providerID}/${def.modelID}` }
       },
     })
+  }
+
+  // A6: record a successfully-set key in the chat's recent list, most-recent
+  // first, de-duplicated, capped. Backs the A1 recent section. In-memory.
+  function recordRecent(chatId: string, key: string): void {
+    const prior = _recentModels.get(chatId) ?? []
+    const next = [key, ...prior.filter((k) => k !== key)].slice(0, RECENT_CAP)
+    _recentModels.set(chatId, next)
+  }
+
+  function getRecent(chatId: string): string[] {
+    return _recentModels.get(chatId) ?? []
   }
 
   // SDD-02 req 19: per-chat session, effective model, and persona.
@@ -517,7 +596,7 @@ export namespace TelegramBot {
         if (config.model) {
           model = config.model
         } else {
-          const { def } = await listAllowedModels(config.models)
+          const { default: def } = await getModelCatalog()
           model = def
         }
       } catch (err) {
@@ -551,7 +630,37 @@ export namespace TelegramBot {
       return
     }
     TelegramStore.setModel(chatId, key)
+    recordRecent(chatId, key)
     await sendMessage(_config.bot_token!, chatId, `Model set to ${key} for this chat.`)
+  }
+
+  // SDD-02 Amendment A (A4/A5): a `model:pick:<n>` selection. Resolve the short
+  // token against this chat's picker state to a concrete key, re-check the
+  // persona policy (defense in depth), persist on success, record recent (A6).
+  // A stale/expired token (no state, or index out of range) changes nothing and
+  // asks the user to re-run `/model`; a forbidden resolved model is rejected.
+  // Never throws.
+  async function handleModelPick(chatId: string, index: number): Promise<void> {
+    const state = _pickerStates.get(chatId)
+    if (!state || !Number.isInteger(index) || index < 0 || index >= state.candidates.length) {
+      await sendMessage(_config.bot_token!, chatId, "That selection has expired. Please re-run /model.")
+      return
+    }
+    const key = state.candidates[index]!
+    await handleModelCallback(chatId, key)
+  }
+
+  // SDD-02 Amendment A (A3/A4): a `model:page:<n>` control. Re-render the
+  // requested page from the chat's picker state. A stale token (no state) asks
+  // the user to re-run `/model`. Never throws.
+  async function handleModelPage(chatId: string, page: number): Promise<void> {
+    const state = _pickerStates.get(chatId)
+    if (!state || !Number.isInteger(page)) {
+      await sendMessage(_config.bot_token!, chatId, "That selection has expired. Please re-run /model.")
+      return
+    }
+    const text = state.term ? `Models matching "${state.term}":` : "Select a model:"
+    await sendPickerPage(chatId, page, text)
   }
 
   // Probe whether a FoxyBear session exists, mirroring the executor's
@@ -738,11 +847,19 @@ export namespace TelegramBot {
       log.info("telegram: awaiting custom answer", { chatId, requestId })
       await sendMessage(_config.bot_token!, chatId, "Type your answer:")
     } else if (data.startsWith(MODEL_PREFIX)) {
-      // SDD-02 req 14: a `/model` inline selection. Re-check the policy before
-      // persisting (SEC-3, defense in depth).
-      const key = data.slice(MODEL_PREFIX.length)
-      if (!key) return
-      await handleModelCallback(chatId, key)
+      // SDD-02 req 14 + Amendment A (A3/A4): a `/model` inline callback. Amendment
+      // A tokens (`pick:<n>`/`page:<n>`) resolve against per-chat picker state so
+      // callback_data stays within Telegram's 64-byte cap; a bare `provider/model`
+      // is the legacy exact-key selection. All set paths re-check the policy
+      // before persisting (SEC-3, defense in depth).
+      const rest = data.slice(MODEL_PREFIX.length)
+      if (rest.startsWith(MODEL_PICK_TOKEN)) {
+        await handleModelPick(chatId, parseInt(rest.slice(MODEL_PICK_TOKEN.length), 10))
+      } else if (rest.startsWith(MODEL_PAGE_TOKEN)) {
+        await handleModelPage(chatId, parseInt(rest.slice(MODEL_PAGE_TOKEN.length), 10))
+      } else if (rest) {
+        await handleModelCallback(chatId, rest)
+      }
     } else {
       log.warn("telegram: unknown callback data", { data })
     }
@@ -825,6 +942,27 @@ export namespace TelegramBot {
     }
   }
 
+  // ---- SDD-02 Amendment A test seams ------------------------------------
+  // The headless test env strips provider API keys, so `Provider.list` is empty
+  // and the real picker would offer nothing. These seams let acceptance tests
+  // inject a catalog and seed the in-memory recent/picker state. Production never
+  // calls them (they only mutate in-memory state that `_reset` clears).
+
+  /** Inject the provider catalog used by the picker (null restores the real one). */
+  export function __setModelCatalog(source: ModelCatalogSource | null): void {
+    _modelCatalogOverride = source
+  }
+
+  /** Seed a chat's recent-models list (most-recent first). */
+  export function __seedRecent(chatId: string, keys: string[]): void {
+    _recentModels.set(chatId, keys.slice(0, RECENT_CAP))
+  }
+
+  /** Seed a chat's picker state so a `model:pick:<n>` token resolves. */
+  export function __seedPicker(chatId: string, state: PickerState): void {
+    _pickerStates.set(chatId, state)
+  }
+
   export function _reset(): void {
     _running = false
     _pollAbort?.abort()
@@ -835,6 +973,9 @@ export namespace TelegramBot {
     _chatStates = new Map()
     _pendingQuestions = new Map()
     _lastProgressEdit = new Map()
+    _pickerStates = new Map()
+    _recentModels = new Map()
+    _modelCatalogOverride = null
     if (_questionUnsub) {
       _questionUnsub()
       _questionUnsub = null

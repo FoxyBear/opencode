@@ -523,7 +523,7 @@ describe("V3 — /model keyboard excludes forbidden families (WHAT 11-12, SEC-3)
   // configured providers, so `/model` with no argument emits no keyboard at all.
   // The filtering LOGIC is covered above and by V2; the SEC-1 executor guard
   // (which stands even if a forbidden button ever slipped through) is covered by V7.
-  test.todo("V3 end-to-end keyboard content/order/cap — needs configured providers (Provider.list empty in headless env)")
+  test.todo("V3 end-to-end keyboard content/order/cap — needs configured providers (Provider.list empty in headless env)", () => {})
 })
 
 // ============================================================================
@@ -532,5 +532,5 @@ describe("V3 — /model keyboard excludes forbidden families (WHAT 11-12, SEC-3)
 // from a single test file. This file's own suite passing is the local check.
 // ============================================================================
 describe("V10 — build/regression (CC-9, WHAT 20)", () => {
-  test.todo("full-suite `bun test` + `tsc --noEmit` are the repo-level gate, run outside this file")
+  test.todo("full-suite `bun test` + `tsc --noEmit` are the repo-level gate, run outside this file", () => {})
 })

@@ -43,11 +43,33 @@ export async function getMe(token: string): Promise<{ id: number; first_name: st
   return telegramApi(token, "getMe")
 }
 
+// Telegram rejects a message when its text has an unbalanced Markdown entity
+// (a lone `_`, `*`, backtick, or `[`) with "can't parse entities". Session ids
+// ("ses_...") and arbitrary LLM output routinely trip this. When it happens we
+// MUST NOT drop the reply: retry the same text as plain (no parse_mode) so
+// delivery always succeeds, keeping Markdown formatting only when it is valid.
+function isParseEntitiesError(err: unknown): boolean {
+  return String(err).includes("can't parse entities")
+}
+
+// Send one message, preferring Markdown but falling back to plain text if
+// Telegram rejects the Markdown parse.
+async function sendOne(token: string, chatId: string, text: string): Promise<any> {
+  try {
+    return await telegramApi(token, "sendMessage", { chat_id: chatId, text, parse_mode: "Markdown" })
+  } catch (err) {
+    if (isParseEntitiesError(err)) {
+      return telegramApi(token, "sendMessage", { chat_id: chatId, text })
+    }
+    throw err
+  }
+}
+
 export async function sendMessage(token: string, chatId: string, text: string): Promise<any> {
   // Telegram has a 4096-char limit per message
   const MAX_LEN = 4096
   if (text.length <= MAX_LEN) {
-    return telegramApi(token, "sendMessage", { chat_id: chatId, text, parse_mode: "Markdown" })
+    return sendOne(token, chatId, text)
   }
 
   // Split into chunks
@@ -60,7 +82,7 @@ export async function sendMessage(token: string, chatId: string, text: string): 
 
   let lastResult: any
   for (const chunk of chunks) {
-    lastResult = await telegramApi(token, "sendMessage", { chat_id: chatId, text: chunk })
+    lastResult = await sendOne(token, chatId, chunk)
   }
   return lastResult
 }
@@ -111,6 +133,17 @@ export async function editMessageText(
     })
   } catch (err) {
     if (String(err).includes("message is not modified")) return
+    // Same Markdown-parse fragility as sendMessage: retry as plain text so a
+    // stray entity in the result never blocks delivery of the edit.
+    if (isParseEntitiesError(err)) {
+      try {
+        await telegramApi(token, "editMessageText", { chat_id: chatId, message_id: messageId, text })
+        return
+      } catch (retryErr) {
+        if (String(retryErr).includes("message is not modified")) return
+        throw retryErr
+      }
+    }
     throw err
   }
 }

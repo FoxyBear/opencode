@@ -216,6 +216,7 @@ describe("SDD-04 split queue/worker/routing — VERIFY", () => {
   // rows present after commit).
   test.todo(
     "V-2a companion: crash inside the ingest transaction leaves update_id out of inbox — no harness seam to fault the sync tx",
+    () => {},
   )
 
   // V-3 (W-10,W-12,W-17 / CC-5): "job_queue.session_id is set (via onSessionCreated),
@@ -431,5 +432,5 @@ describe("SDD-04 split queue/worker/routing — VERIFY", () => {
   // V-4 (W-10,W-11) claim atomicity — two concurrent claims, at most one wins —
   // is verified at the Queue level in test/queue/queue.test.ts. Referenced here per
   // the spec's VERIFY map; NOT duplicated (independence + no redundant coverage).
-  test.todo("V-4 claim atomicity: covered by test/queue/queue.test.ts (reference, not duplicated)")
+  test.todo("V-4 claim atomicity: covered by test/queue/queue.test.ts (reference, not duplicated)", () => {})
 })

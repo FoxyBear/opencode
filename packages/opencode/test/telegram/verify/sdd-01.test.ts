@@ -113,9 +113,9 @@ function seedRealSession(id: string): void {
 }
 
 function realSessionExists(id: string): boolean {
-  return (
-    Database.use((db) => db.select().from(SessionTable).where(eq(SessionTable.id, id)).get()) !== undefined
-  )
+  // SessionTable.id is a branded SessionID column; cast the plain string for the
+  // equality (test helper only).
+  return Database.use((db) => db.select().from(SessionTable).where(eq(SessionTable.id, id as any)).all()).length > 0
 }
 
 let harness: TelegramHarness
@@ -208,7 +208,7 @@ describe("SDD-01 durable per-chat sessions — VERIFY", () => {
   // session executor (HeadlessSession.setRunner), so no rows are written to the
   // message/part tables and sdk.session.messages has nothing to return. Real
   // context accrual is the reused TUI/web run-loop path, out of SDD-01's own code.
-  test.todo("V2b message stream shows A then B — stubbed runner does not persist message rows")
+  test.todo("V2b message stream shows A then B — stubbed runner does not persist message rows", () => {})
 
   // V3 — self-heal on stale id (req 3, SC-2).
   // "the worker SHALL self-heal by creating a new session ... and via
@@ -608,7 +608,7 @@ describe("SDD-01 durable per-chat sessions — VERIFY", () => {
 
   // V13 — build/regression green (CC-9). Whole-suite typecheck + `bun test` is a
   // CI-level gate run outside this file; not a unit test in this suite.
-  test.todo("V13 bun run typecheck + full bun test green — CI-level gate, not runnable as a single unit test")
+  test.todo("V13 bun run typecheck + full bun test green — CI-level gate, not runnable as a single unit test", () => {})
 })
 
 // Local, un-awaited worker kick for the gate tests (mirrors harness.drain()'s

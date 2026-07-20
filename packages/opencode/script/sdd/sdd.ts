@@ -363,6 +363,17 @@ async function cmdTests(arg?: string): Promise<void> {
   // still requires the tests to pass, but records that they were not red-first.
   const retroactive = state.implement[spec.id]?.status === "passed"
 
+  // Acceptance tests must also typecheck — a test file that fails tsc is not a
+  // valid gate (bun test does not typecheck). Run the repo typecheck first.
+  console.log("→ typecheck")
+  const tc = await $`bun run typecheck`.nothrow()
+  if (tc.exitCode !== 0) {
+    state.tests[spec.id] = { status: "failed", at: now(), retroactive }
+    saveState(state)
+    die(`typecheck failed — the acceptance tests (or code) do not compile. Fix before ${spec.id} can gate implement.`)
+  }
+  pass("typecheck")
+
   console.log(`→ running ${testFile}`)
   const r = await runBaselineTolerantTests(testFile)
   if (r.broken) {

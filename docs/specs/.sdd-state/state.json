@@ -14,6 +14,28 @@
       "approvedBy": "toddenglish"
     }
   },
+  "tests": {
+    "sdd-01": {
+      "status": "passed",
+      "at": "2026-07-20T16:03:41.742Z",
+      "retroactive": true
+    },
+    "sdd-02": {
+      "status": "passed",
+      "at": "2026-07-20T16:03:45.050Z",
+      "retroactive": true
+    },
+    "sdd-03": {
+      "status": "passed",
+      "at": "2026-07-20T16:03:48.278Z",
+      "retroactive": true
+    },
+    "sdd-04": {
+      "status": "passed",
+      "at": "2026-07-20T16:03:51.422Z",
+      "retroactive": true
+    }
+  },
   "implement": {
     "sdd-04": {
       "status": "passed",
@@ -34,16 +56,20 @@
   },
   "verify": {
     "sdd-04": {
-      "status": "pending"
+      "status": "passed",
+      "at": "2026-07-20T16:05:23.851Z"
     },
     "sdd-01": {
-      "status": "pending"
+      "status": "passed",
+      "at": "2026-07-20T16:05:23.234Z"
     },
     "sdd-02": {
-      "status": "pending"
+      "status": "passed",
+      "at": "2026-07-20T16:05:23.436Z"
     },
     "sdd-03": {
-      "status": "pending"
+      "status": "passed",
+      "at": "2026-07-20T16:05:23.642Z"
     }
   }
 }

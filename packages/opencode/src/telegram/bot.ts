@@ -21,7 +21,6 @@ export interface TelegramConfig {
   allowed_chat_ids: string[]
   notify_chat_id?: string
   persona: string
-  session_ttl_ms: number
   session_timeout_ms: number
   progress_interval_ms: number
   max_response_length: number
@@ -31,7 +30,6 @@ const DEFAULT_CONFIG: TelegramConfig = {
   enabled: false,
   allowed_chat_ids: [],
   persona: "katya",
-  session_ttl_ms: 30 * 60 * 1000, // 30 minutes
   session_timeout_ms: 10 * 60 * 1000, // 10 minutes
   progress_interval_ms: 60 * 1000, // 1 minute
   max_response_length: 4096,
@@ -60,6 +58,14 @@ const CUSTOM_PREFIX = "qcustom:"
 
 const DELIVERY_INTERVAL_MS = 1500
 const PROGRESS_DEBOUNCE_MS = 3000
+
+// SDD-01 req 11: `/new` and `/resume` are chat-scoped and handled locally in the
+// bot layer, never routed through HarnessCommands. They are appended to `/help`
+// output so the registry help still lists every command a user can issue.
+const LOCAL_COMMAND_HELP =
+  "\n\nSession:\n" +
+  "  /new — start a fresh conversation (unbinds this chat's session)\n" +
+  "  /resume <session-id> — bind this chat to an existing session"
 
 export namespace TelegramBot {
   let _running = false
@@ -195,16 +201,35 @@ export namespace TelegramBot {
     const cmd = text.split(/[\s@]/)[0]
     if (cmd.startsWith("/")) {
       const slashName = cmd.slice(1)
+      const args = text.slice(cmd.length).trim()
+
+      // SDD-01 req 11: `/new` and `/resume` are chat-scoped session-mutating
+      // commands. They read/write this chat's telegram_session row and validate
+      // sessions via the SDK, so they are dispatched here in the bot layer
+      // (where chatId, TelegramStore, and the SDK are in scope) and returned
+      // early — they MUST NOT reach the shared HarnessCommands registry.
+      if (slashName === "new" || slashName === "resume") {
+        // Dedup the inline command before mutating so a redelivered update
+        // cannot apply it twice.
+        if (!Queue.inboxCheckAndInsert(updateId)) return
+        if (slashName === "new") {
+          await handleNew(chatId)
+        } else {
+          await handleResume(chatId, args)
+        }
+        return
+      }
+
       const known = slashName === "help" || !!HarnessCommands.find(slashName)
       if (known) {
         // Dedup the inline command before executing so a redelivered update
         // cannot run it twice (e.g. /stop).
         if (!Queue.inboxCheckAndInsert(updateId)) return
         if (slashName === "help") {
-          await sendMessage(_config.bot_token!, chatId, HarnessCommands.helpText())
+          await sendMessage(_config.bot_token!, chatId, HarnessCommands.helpText() + LOCAL_COMMAND_HELP)
           return
         }
-        const result = await HarnessCommands.execute(slashName, text.slice(cmd.length).trim(), { chatId })
+        const result = await HarnessCommands.execute(slashName, args, { chatId })
         if (result) await sendMessage(_config.bot_token!, chatId, result.text)
         return
       }
@@ -260,6 +285,72 @@ export namespace TelegramBot {
     }
 
     JobWorker.nudge()
+  }
+
+  // SDD-01 req 6: `/new` unbinds the chat's durable session (session_id -> NULL)
+  // while preserving model_override and persona, so the next message starts a
+  // fresh session (worker create + write-back). It does NOT delete the
+  // underlying FoxyBear session rows; it only unbinds this chat.
+  async function handleNew(chatId: string): Promise<void> {
+    TelegramStore.clearSession(chatId)
+    await sendMessage(
+      _config.bot_token!,
+      chatId,
+      "Started a fresh session. Your next message begins a new conversation.",
+    )
+  }
+
+  // SDD-01 req 7: `/resume <id>` binds the chat to an existing FoxyBear session
+  // after validating it exists via the SDK. A missing arg replies with usage; an
+  // unknown id replies not-found; both leave the current mapping untouched.
+  async function handleResume(chatId: string, args: string): Promise<void> {
+    const sessionId = args.split(/\s+/)[0]?.trim()
+    if (!sessionId) {
+      await sendMessage(_config.bot_token!, chatId, "Usage: /resume <session-id>")
+      return
+    }
+    if (!(await sessionExists(sessionId))) {
+      await sendMessage(_config.bot_token!, chatId, `No session found for id ${sessionId}.`)
+      return
+    }
+    TelegramStore.setSession(chatId, sessionId)
+    await sendMessage(
+      _config.bot_token!,
+      chatId,
+      `Resumed session ${sessionId}. Your next message continues that conversation.`,
+    )
+  }
+
+  // Probe whether a FoxyBear session exists, mirroring the executor's
+  // Instance.provide pattern (src/daemon/runner.ts) so the SDK call runs with
+  // full instance context. A thrown error, an error result, or a missing data
+  // payload all mean the session does not exist (req 7). The v2 client does not
+  // throw on non-2xx by default, so the error/data shape must be inspected.
+  async function sessionExists(sessionId: string): Promise<boolean> {
+    const { Server } = await import("../server/server")
+    const { createOpencodeClient } = await import("@opencode-ai/sdk/v2")
+    const { Instance } = await import("../project/instance")
+    const { InstanceBootstrap } = await import("../project/bootstrap")
+    const { AppRuntime } = await import("../effect/app-runtime")
+
+    try {
+      return await Instance.provide({
+        directory: process.cwd(),
+        init: () => AppRuntime.runPromise(InstanceBootstrap),
+        async fn(): Promise<boolean> {
+          const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+            const request = new Request(input, init)
+            return Server.Default().app.fetch(request)
+          }) as typeof globalThis.fetch
+          const sdk = createOpencodeClient({ baseUrl: "http://foxybear.internal", fetch: fetchFn })
+          const res: any = await sdk.session.messages({ sessionID: sessionId } as any)
+          return !res?.error && res?.data != null
+        },
+      })
+    } catch (err) {
+      log.info("telegram: /resume session probe failed", { sessionId, error: String(err) })
+      return false
+    }
   }
 
   function startDeliveryLoop(): void {

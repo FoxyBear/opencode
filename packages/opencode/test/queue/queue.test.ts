@@ -182,3 +182,47 @@ describe("TelegramStore session lifecycle (SC-1)", () => {
     expect(TelegramStore.getBySession(sid)?.chat_id).toBe(chat)
   })
 })
+
+describe("Ingestion contributes stored sessionId (SDD-01 req 2)", () => {
+  test("a chat with a stored session_id enqueues a job carrying it as payload.sessionId", () => {
+    const chat = uchat()
+    TelegramStore.upsert(chat, { persona: "katya" })
+    TelegramStore.setSession(chat, "ses_resume_1")
+
+    // Mirror processMessage's payload construction from the durable row: the
+    // stored session_id becomes payload.sessionId, which the worker resumes.
+    const row = TelegramStore.getByChat(chat)!
+    const { enqueued, jobId } = Queue.ingestChatMessage(uid(), {
+      kind: "chat_message",
+      payload: {
+        prompt: "second message",
+        persona: row.persona ?? "katya",
+        ...(row.session_id ? { sessionId: row.session_id } : {}),
+      },
+      chat_id: chat,
+    })
+
+    expect(enqueued).toBe(true)
+    const job = Queue.get(jobId!)!
+    expect(job.payload.sessionId).toBe("ses_resume_1")
+    expect(job.payload.persona).toBe("katya")
+  })
+
+  test("a chat with no stored session_id enqueues a job with undefined payload.sessionId", () => {
+    const chat = uchat()
+    const row = TelegramStore.getByChat(chat)
+    const sessionId = row?.session_id ?? undefined
+    const { enqueued, jobId } = Queue.ingestChatMessage(uid(), {
+      kind: "chat_message",
+      payload: {
+        prompt: "first message",
+        ...(sessionId ? { sessionId } : {}),
+      },
+      chat_id: chat,
+    })
+
+    expect(enqueued).toBe(true)
+    const job = Queue.get(jobId!)!
+    expect(job.payload.sessionId).toBeUndefined()
+  })
+})

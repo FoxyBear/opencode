@@ -1,5 +1,7 @@
+import { Effect } from "effect"
 import { HeadlessSession, type HeadlessRunResult, type RunModel } from "./headless"
 import { PersonaSession } from "../persona/session"
+import { PersonaPolicy } from "../persona/policy"
 import { Log } from "../util/log"
 import type { SessionID } from "../session/schema"
 
@@ -32,6 +34,52 @@ export namespace Runner {
       return executor.execute(prompt, effectivePersona, signal, onSessionCreated, sessionId, chatId, model)
     })
     log.info("headless runner wired")
+  }
+
+  /**
+   * SEC-1 (WHAT 5-8, 17, SC-4): resolve the effective model CONCRETELY and guard
+   * it at a single choke point, before the prompt is ever sent.
+   *
+   * Precedence: chat override > persona frontmatter `model` > `resolveDefault()`.
+   * For a policy-bearing persona the model is NEVER left `undefined`: an absent
+   * override AND frontmatter forces a concrete default so the guard cannot be
+   * skipped by falling through to the SDK's Anthropic/OpenAI-biased default.
+   *
+   * The policy is read from `resolvedPersona.config.models` (the real field);
+   * the guard gate and `assertModelAllowed` both key off `config.models`, so a
+   * wrong-field / no-op guard is impossible. A non-policy persona keeps the
+   * original behavior exactly: no forced default resolution, no guard, model may
+   * stay `undefined` (WHAT 20). `resolveDefault` is injected so this seam is unit
+   * testable without the Provider Effect graph, and it is only invoked for a
+   * policy-bearing persona with no explicit model.
+   */
+  export async function resolveEffectiveModel(
+    resolvedPersona: PersonaSession.ResolvedPersona | undefined,
+    override: RunModel | undefined,
+    resolveDefault: () => Promise<RunModel>,
+  ): Promise<RunModel | undefined> {
+    let effective: RunModel | undefined = override ?? parsePersonaModel(resolvedPersona?.model)
+
+    const policyBearing = !!resolvedPersona && PersonaPolicy.hasPolicy(resolvedPersona.config.models)
+
+    if (!effective && policyBearing) {
+      effective = await resolveDefault()
+    }
+    if (policyBearing && effective) {
+      // SC-4: pass the policy CARRIER (config), never the ResolvedPersona.
+      PersonaPolicy.assertModelAllowed(resolvedPersona!.config, effective)
+    }
+    return effective
+  }
+
+  // Split a persona frontmatter `provider/model` string, matching
+  // Provider.parseModel runtime semantics (first `/` separates provider from the
+  // rest) without importing the Provider Effect module.
+  function parsePersonaModel(model: string | undefined): RunModel | undefined {
+    if (!model) return undefined
+    const idx = model.indexOf("/")
+    if (idx < 0) return { providerID: model, modelID: "" }
+    return { providerID: model.slice(0, idx), modelID: model.slice(idx + 1) }
   }
 
   async function readConfigPersona(getConfig: () => Promise<any>): Promise<string | undefined> {
@@ -115,8 +163,20 @@ export namespace Runner {
             }
 
             try {
-              // Chat model override (SDD-02) wins over persona frontmatter.
-              const model = overrideModel ?? (resolvedPersona?.model ? Provider.parseModel(resolvedPersona.model) : undefined)
+              // SEC-1 choke point (SDD-02): resolve the effective model with
+              // precedence override > frontmatter > default, and assert it is
+              // allowed BEFORE sdk.session.prompt. For a policy-bearing persona a
+              // denied model from ANY path throws here and the prompt is never
+              // sent. `Provider.defaultModel()` supplies the concrete fallback so
+              // no denied default can slip through as `undefined`.
+              const model = await resolveEffectiveModel(resolvedPersona, overrideModel, () =>
+                AppRuntime.runPromise(
+                  Effect.gen(function* () {
+                    const svc = yield* Provider.Service
+                    return yield* svc.defaultModel()
+                  }),
+                ),
+              )
               const response = await sdk.session.prompt({
                 sessionID,
                 parts: [{ type: "text", text: prompt }],

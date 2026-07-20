@@ -9,9 +9,11 @@ import {
 } from "./api"
 import { HarnessCommands } from "../harness/commands"
 import { TelegramStore } from "./store"
+import { PersonaPolicy } from "../persona/policy"
 import { Queue } from "../queue/queue"
 import { JobWorker } from "../queue/worker"
 import { Log } from "../util/log"
+import type { PersonaConfig } from "../persona/index"
 
 const log = Log.create({ service: "telegram" })
 
@@ -55,6 +57,11 @@ interface PendingQuestion {
 
 const QUESTION_PREFIX = "q:"
 const CUSTOM_PREFIX = "qcustom:"
+// SDD-02: inline-keyboard callback for a `/model` selection.
+const MODEL_PREFIX = "model:"
+// SDD-02: cap the `/model` keyboard — sendMessageWithKeyboard renders one button
+// per row, so an unbounded list would flood the chat.
+const MODEL_KEYBOARD_CAP = 8
 
 const DELIVERY_INTERVAL_MS = 1500
 const PROGRESS_DEBOUNCE_MS = 3000
@@ -65,7 +72,9 @@ const PROGRESS_DEBOUNCE_MS = 3000
 const LOCAL_COMMAND_HELP =
   "\n\nSession:\n" +
   "  /new — start a fresh conversation (unbinds this chat's session)\n" +
-  "  /resume <session-id> — bind this chat to an existing session"
+  "  /resume <session-id> — bind this chat to an existing session\n" +
+  "  /model [provider/model] — show or set this chat's model\n" +
+  "  /status — show this chat's session, model, and persona"
 
 export namespace TelegramBot {
   let _running = false
@@ -220,6 +229,21 @@ export namespace TelegramBot {
         return
       }
 
+      // SDD-02 req 11-13, 19: `/model` and `/status` are chat-scoped (they need
+      // chatId, the chat's persona/policy, TelegramStore, and the provider list),
+      // so they are handled here in the bot layer and never routed through the
+      // shared HarnessCommands registry. `/status` intentionally shadows the
+      // registry `/status` on the Telegram surface with a per-chat view.
+      if (slashName === "model" || slashName === "status") {
+        if (!Queue.inboxCheckAndInsert(updateId)) return
+        if (slashName === "model") {
+          await handleModel(chatId, args)
+        } else {
+          await handleStatus(chatId)
+        }
+        return
+      }
+
       const known = slashName === "help" || !!HarnessCommands.find(slashName)
       if (known) {
         // Dedup the inline command before executing so a redelivered update
@@ -319,6 +343,208 @@ export namespace TelegramBot {
       chatId,
       `Resumed session ${sessionId}. Your next message continues that conversation.`,
     )
+  }
+
+  function personaForChat(chatId: string): string {
+    return TelegramStore.getByChat(chatId)?.persona ?? _config.persona
+  }
+
+  // SDD-02: load the chat persona's config inside instance context so its model
+  // policy can be evaluated. Throws when the persona file is missing or fails to
+  // parse (fail-closed, SC-4): callers treat a throw as "cannot determine the
+  // policy" and refuse to offer or set a model rather than defaulting to
+  // allow-all.
+  async function loadPersonaConfig(persona: string): Promise<PersonaConfig> {
+    const { Persona } = await import("../persona/index")
+    const { Instance } = await import("../project/instance")
+    const { InstanceBootstrap } = await import("../project/bootstrap")
+    const { AppRuntime } = await import("../effect/app-runtime")
+    return Instance.provide({
+      directory: process.cwd(),
+      init: () => AppRuntime.runPromise(InstanceBootstrap),
+      fn: () => Persona.load(persona),
+    })
+  }
+
+  function modelKey(model: { providerID: string; modelID: string }): string {
+    return `${model.providerID}/${model.modelID}`
+  }
+
+  // SDD-02 req 11-13, SEC-3: `/model` shows the current effective model + an
+  // inline keyboard of ALLOWED models (no arg), or sets a per-chat override
+  // (with arg). The persona policy is the filter/gate here (defense in depth
+  // over the SEC-1 executor guard). Any inability to load the policy fails
+  // closed: the model is left unchanged.
+  async function handleModel(chatId: string, args: string): Promise<void> {
+    const arg = args.trim()
+    const persona = personaForChat(chatId)
+    const override = TelegramStore.getModel(chatId)
+
+    let config: PersonaConfig
+    try {
+      config = await loadPersonaConfig(persona)
+    } catch (err) {
+      log.warn("telegram: /model could not load persona policy", { persona, error: String(err) })
+      await sendMessage(_config.bot_token!, chatId, `Could not load persona "${persona}"; model unchanged.`)
+      return
+    }
+    const policy = config.models
+
+    if (arg) {
+      // Set path (req 13): parse -> exists? -> allowed? -> persist override.
+      try {
+        const { exists, key } = await checkModel(arg)
+        if (!exists) {
+          await sendMessage(_config.bot_token!, chatId, `Unknown model: ${arg}. It is not available on any configured provider.`)
+          return
+        }
+        if (!PersonaPolicy.isModelAllowed(policy, key)) {
+          await sendMessage(_config.bot_token!, chatId, `Model ${key} is not allowed for persona "${persona}".`)
+          return
+        }
+        TelegramStore.setModel(chatId, key)
+        await sendMessage(_config.bot_token!, chatId, `Model set to ${key} for this chat.`)
+      } catch (err) {
+        log.warn("telegram: /model set failed", { chatId, arg, error: String(err) })
+        await sendMessage(_config.bot_token!, chatId, "Could not set the model. Please try again.")
+      }
+      return
+    }
+
+    // List path (req 11-12): current effective model + allowed keyboard.
+    try {
+      const { candidates, def } = await listAllowedModels(policy)
+      const effective = override ? modelKey(override) : config.model ?? def
+      const buttons = candidates.map((key) => ({ text: key, callback_data: `${MODEL_PREFIX}${key}` }))
+      const text = `Current model: ${effective}`
+      if (buttons.length > 0) {
+        await sendMessageWithKeyboard(_config.bot_token!, chatId, `${text}\n\nSelect a model:`, buttons)
+      } else {
+        await sendMessage(_config.bot_token!, chatId, `${text}\n\n(no selectable models available for this persona)`)
+      }
+    } catch (err) {
+      log.warn("telegram: /model list failed", { chatId, error: String(err) })
+      await sendMessage(_config.bot_token!, chatId, "Could not list models. Please try again.")
+    }
+  }
+
+  // Validate a `provider/model` string exists on some configured provider,
+  // reusing Provider.parseModel + Provider.getModel (req 13). Returns the parsed
+  // key so the caller can reuse it.
+  async function checkModel(arg: string): Promise<{ exists: boolean; key: string }> {
+    const { Provider } = await import("../provider/provider")
+    const { Instance } = await import("../project/instance")
+    const { InstanceBootstrap } = await import("../project/bootstrap")
+    const { AppRuntime } = await import("../effect/app-runtime")
+    const { Effect } = await import("effect")
+    return Instance.provide({
+      directory: process.cwd(),
+      init: () => AppRuntime.runPromise(InstanceBootstrap),
+      async fn() {
+        const parsed = Provider.parseModel(arg)
+        const key = `${parsed.providerID}/${parsed.modelID}`
+        const exists = await AppRuntime.runPromise(
+          Effect.gen(function* () {
+            const svc = yield* Provider.Service
+            yield* svc.getModel(parsed.providerID, parsed.modelID)
+            return true
+          }),
+        ).catch(() => false)
+        return { exists, key }
+      },
+    })
+  }
+
+  // Enumerate provider models, filter through the persona policy (req 12),
+  // order via Provider.sort, and cap to MODEL_KEYBOARD_CAP. Also returns the
+  // concrete default model key for the current-model display.
+  async function listAllowedModels(
+    policy: PersonaPolicy.ModelPolicy | undefined,
+  ): Promise<{ candidates: string[]; def: string }> {
+    const { Provider } = await import("../provider/provider")
+    const { Instance } = await import("../project/instance")
+    const { InstanceBootstrap } = await import("../project/bootstrap")
+    const { AppRuntime } = await import("../effect/app-runtime")
+    const { Effect } = await import("effect")
+    return Instance.provide({
+      directory: process.cwd(),
+      init: () => AppRuntime.runPromise(InstanceBootstrap),
+      async fn() {
+        const { providers, def } = await AppRuntime.runPromise(
+          Effect.gen(function* () {
+            const svc = yield* Provider.Service
+            return { providers: yield* svc.list(), def: yield* svc.defaultModel() }
+          }),
+        )
+        const pidByModel = new Map<any, string>()
+        const models: any[] = []
+        for (const [pid, prov] of Object.entries(providers)) {
+          for (const model of Object.values((prov as any).models)) {
+            const key = `${pid}/${(model as any).id}`
+            if (PersonaPolicy.isModelAllowed(policy, key)) {
+              pidByModel.set(model, pid)
+              models.push(model)
+            }
+          }
+        }
+        const sorted = Provider.sort(models).slice(0, MODEL_KEYBOARD_CAP)
+        const candidates = sorted.map((m: any) => `${pidByModel.get(m)}/${m.id}`)
+        return { candidates, def: `${def.providerID}/${def.modelID}` }
+      },
+    })
+  }
+
+  // SDD-02 req 19: per-chat session, effective model, and persona.
+  async function handleStatus(chatId: string): Promise<void> {
+    const row = TelegramStore.getByChat(chatId)
+    const persona = personaForChat(chatId)
+    const override = TelegramStore.getModel(chatId)
+    const sessionId = row?.session_id ?? "(none — next message starts a new session)"
+
+    let model: string
+    if (override) {
+      model = modelKey(override)
+    } else {
+      try {
+        const config = await loadPersonaConfig(persona)
+        if (config.model) {
+          model = config.model
+        } else {
+          const { def } = await listAllowedModels(config.models)
+          model = def
+        }
+      } catch (err) {
+        log.warn("telegram: /status model resolution failed", { persona, error: String(err) })
+        model = "(unresolved)"
+      }
+    }
+
+    await sendMessage(
+      _config.bot_token!,
+      chatId,
+      `Session: ${sessionId}\nModel: ${model}\nPersona: ${persona}`,
+    )
+  }
+
+  // SDD-02 req 14, SEC-3: a `/model` inline selection. Re-check the policy (never
+  // trust the button alone), persist on success, error otherwise. On any policy
+  // load failure, fail closed and leave the override unchanged.
+  async function handleModelCallback(chatId: string, key: string): Promise<void> {
+    const persona = personaForChat(chatId)
+    let config: PersonaConfig
+    try {
+      config = await loadPersonaConfig(persona)
+    } catch (err) {
+      log.warn("telegram: model callback could not load persona policy", { persona, error: String(err) })
+      await sendMessage(_config.bot_token!, chatId, `Could not load persona "${persona}"; model unchanged.`)
+      return
+    }
+    if (!PersonaPolicy.isModelAllowed(config.models, key)) {
+      await sendMessage(_config.bot_token!, chatId, `Model ${key} is not allowed for persona "${persona}".`)
+      return
+    }
+    TelegramStore.setModel(chatId, key)
+    await sendMessage(_config.bot_token!, chatId, `Model set to ${key} for this chat.`)
   }
 
   // Probe whether a FoxyBear session exists, mirroring the executor's
@@ -481,6 +707,12 @@ export namespace TelegramBot {
       state.awaitingCustomAnswer = { questionRequestId: requestId, questionIndex: parseInt(qiStr, 10) }
       log.info("telegram: awaiting custom answer", { chatId, requestId })
       await sendMessage(_config.bot_token!, chatId, "Type your answer:")
+    } else if (data.startsWith(MODEL_PREFIX)) {
+      // SDD-02 req 14: a `/model` inline selection. Re-check the policy before
+      // persisting (SEC-3, defense in depth).
+      const key = data.slice(MODEL_PREFIX.length)
+      if (!key) return
+      await handleModelCallback(chatId, key)
     } else {
       log.warn("telegram: unknown callback data", { data })
     }

@@ -22,6 +22,10 @@
     "sdd-01": {
       "status": "passed",
       "at": "2026-07-20T11:35:38.365Z"
+    },
+    "sdd-02": {
+      "status": "passed",
+      "at": "2026-07-20T12:01:45.789Z"
     }
   },
   "verify": {
@@ -29,6 +33,9 @@
       "status": "pending"
     },
     "sdd-01": {
+      "status": "pending"
+    },
+    "sdd-02": {
       "status": "pending"
     }
   }

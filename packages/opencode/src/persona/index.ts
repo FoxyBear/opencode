@@ -15,6 +15,15 @@ export interface PersonaConfig {
     require?: string[]
     prefer?: string[]
   }
+  // SDD-02 SC-4: the allow/deny model policy lives in persona frontmatter, so the
+  // security boundary is a property of the persona identity. Globs are
+  // `providerID/modelID` strings (e.g. `anthropic/*`, `openai/gpt-5*`, `*`).
+  // WHEN the frontmatter omits `models`, this is `undefined` and behavior is
+  // unchanged (no policy = allow all).
+  readonly models?: {
+    allow?: string[]
+    deny?: string[]
+  }
   readonly content: string
 }
 
@@ -119,6 +128,14 @@ export namespace Persona {
           ? {
               require: Array.isArray(data.tools.require) ? data.tools.require : undefined,
               prefer: Array.isArray(data.tools.prefer) ? data.tools.prefer : undefined,
+            }
+          : undefined,
+        // SDD-02 SC-4: coerce allow/deny to `string[] | undefined`, mirroring the
+        // tools.require/prefer array-guarding above.
+        models: data.models
+          ? {
+              allow: Array.isArray(data.models.allow) ? data.models.allow : undefined,
+              deny: Array.isArray(data.models.deny) ? data.models.deny : undefined,
             }
           : undefined,
         content: parsed.content.trim(),

@@ -1,6 +1,19 @@
 const BASE = "https://api.telegram.org/bot"
 
-export async function telegramApi(token: string, method: string, body?: Record<string, unknown>): Promise<any> {
+// Transport indirection: every Telegram HTTP call funnels through `_transport`.
+// Production uses `realTransport` (the network). Tests inject a recording/mock
+// transport via `__setTransport` so the full api.ts logic (message chunking,
+// keyboard row building, the editMessageText "not modified" swallow, etc.) still
+// runs while the network boundary is stubbed. `__setTransport(null)` restores
+// the real transport, so production behavior is identical when no test is
+// active. This is the SOLE test seam added to this module.
+export type TelegramTransport = (
+  token: string,
+  method: string,
+  body?: Record<string, unknown>,
+) => Promise<any>
+
+const realTransport: TelegramTransport = async (token, method, body) => {
   const url = `${BASE}${token}/${method}`
   const res = await fetch(url, {
     method: body ? "POST" : "GET",
@@ -8,11 +21,22 @@ export async function telegramApi(token: string, method: string, body?: Record<s
     body: body ? JSON.stringify(body) : undefined,
   })
 
-  const data = await res.json() as { ok: boolean; result?: any; description?: string }
+  const data = (await res.json()) as { ok: boolean; result?: any; description?: string }
   if (!data.ok) {
     throw new Error(`Telegram API error: ${data.description ?? res.status}`)
   }
   return data.result
+}
+
+let _transport: TelegramTransport = realTransport
+
+/** Test-only: swap the network transport. Pass null to restore production. */
+export function __setTransport(transport: TelegramTransport | null): void {
+  _transport = transport ?? realTransport
+}
+
+export async function telegramApi(token: string, method: string, body?: Record<string, unknown>): Promise<any> {
+  return _transport(token, method, body)
 }
 
 export async function getMe(token: string): Promise<{ id: number; first_name: string; username?: string }> {

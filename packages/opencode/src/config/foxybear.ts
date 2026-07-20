@@ -121,7 +121,6 @@ export const FoxyBearFields = {
       allowed_chat_ids: z.array(z.string()).default([]).describe("Allowed Telegram chat IDs"),
       notify_chat_id: z.string().optional().describe("Chat ID for scheduled task notifications"),
       persona: z.string().default("katya").describe("Default persona for Telegram sessions"),
-      session_ttl_ms: z.number().default(1_800_000).describe("Session TTL for conversation continuity (30min)"),
     })
     .optional(),
 }

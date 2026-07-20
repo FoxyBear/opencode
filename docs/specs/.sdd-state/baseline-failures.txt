@@ -1,0 +1,9 @@
+# Known pre-existing test failures at the start of the Telegram overhaul.
+# Verified on 2026-07-20 against the code baseline (port/foxybear-v2, changes
+# stashed): the full suite is 1897 pass / 3 fail with exactly these three
+# shell-process-cancellation tests, which are timing/OS-sensitive and unrelated
+# to the Telegram work. The `make sdd implement` gate tolerates these and fails
+# only on NEW failures. One test name per line; comments start with '#'.
+cancel interrupts shell and resolves cleanly
+cancel persists aborted shell result when shell ignores TERM
+cancel interrupts loop queued behind shell

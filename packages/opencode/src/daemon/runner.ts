@@ -1,5 +1,7 @@
-import { HeadlessSession, type HeadlessRunResult } from "./headless"
+import { Effect } from "effect"
+import { HeadlessSession, type HeadlessRunResult, type RunModel } from "./headless"
 import { PersonaSession } from "../persona/session"
+import { PersonaPolicy } from "../persona/policy"
 import { Log } from "../util/log"
 import type { SessionID } from "../session/schema"
 
@@ -7,11 +9,15 @@ const log = Log.create({ service: "daemon.runner" })
 
 export namespace Runner {
   export interface SessionExecutor {
+    // SDD-04 SC-2: `sessionId`/`chatId`/`model` are additive/optional.
     execute(
       prompt: string,
       persona?: string,
       signal?: AbortSignal,
       onSessionCreated?: (sessionId: string) => void,
+      sessionId?: string,
+      chatId?: string,
+      model?: RunModel,
     ): Promise<HeadlessRunResult>
   }
 
@@ -22,12 +28,58 @@ export namespace Runner {
 
   export function wire(opts: WireOptions = {}): void {
     const executor = opts.executor ?? buildDefaultExecutor()
-    HeadlessSession.setRunner(async (prompt, persona, signal, onSessionCreated) => {
+    HeadlessSession.setRunner(async (prompt, persona, signal, onSessionCreated, sessionId, chatId, model) => {
       const effectivePersona = persona ?? (opts.getConfig ? await readConfigPersona(opts.getConfig) : undefined)
-      log.info("runner invoked", { persona: effectivePersona })
-      return executor.execute(prompt, effectivePersona, signal, onSessionCreated)
+      log.info("runner invoked", { persona: effectivePersona, resume: !!sessionId, override: !!model })
+      return executor.execute(prompt, effectivePersona, signal, onSessionCreated, sessionId, chatId, model)
     })
     log.info("headless runner wired")
+  }
+
+  /**
+   * SEC-1 (WHAT 5-8, 17, SC-4): resolve the effective model CONCRETELY and guard
+   * it at a single choke point, before the prompt is ever sent.
+   *
+   * Precedence: chat override > persona frontmatter `model` > `resolveDefault()`.
+   * For a policy-bearing persona the model is NEVER left `undefined`: an absent
+   * override AND frontmatter forces a concrete default so the guard cannot be
+   * skipped by falling through to the SDK's Anthropic/OpenAI-biased default.
+   *
+   * The policy is read from `resolvedPersona.config.models` (the real field);
+   * the guard gate and `assertModelAllowed` both key off `config.models`, so a
+   * wrong-field / no-op guard is impossible. A non-policy persona keeps the
+   * original behavior exactly: no forced default resolution, no guard, model may
+   * stay `undefined` (WHAT 20). `resolveDefault` is injected so this seam is unit
+   * testable without the Provider Effect graph, and it is only invoked for a
+   * policy-bearing persona with no explicit model.
+   */
+  export async function resolveEffectiveModel(
+    resolvedPersona: PersonaSession.ResolvedPersona | undefined,
+    override: RunModel | undefined,
+    resolveDefault: () => Promise<RunModel>,
+  ): Promise<RunModel | undefined> {
+    let effective: RunModel | undefined = override ?? parsePersonaModel(resolvedPersona?.model)
+
+    const policyBearing = !!resolvedPersona && PersonaPolicy.hasPolicy(resolvedPersona.config.models)
+
+    if (!effective && policyBearing) {
+      effective = await resolveDefault()
+    }
+    if (policyBearing && effective) {
+      // SC-4: pass the policy CARRIER (config), never the ResolvedPersona.
+      PersonaPolicy.assertModelAllowed(resolvedPersona!.config, effective)
+    }
+    return effective
+  }
+
+  // Split a persona frontmatter `provider/model` string, matching
+  // Provider.parseModel runtime semantics (first `/` separates provider from the
+  // rest) without importing the Provider Effect module.
+  function parsePersonaModel(model: string | undefined): RunModel | undefined {
+    if (!model) return undefined
+    const idx = model.indexOf("/")
+    if (idx < 0) return { providerID: model, modelID: "" }
+    return { providerID: model.slice(0, idx), modelID: model.slice(idx + 1) }
   }
 
   async function readConfigPersona(getConfig: () => Promise<any>): Promise<string | undefined> {
@@ -43,7 +95,11 @@ export namespace Runner {
 
   function buildDefaultExecutor(): SessionExecutor {
     return {
-      async execute(prompt, persona, _signal, onSessionCreated): Promise<HeadlessRunResult> {
+      // SDD-04: `_signal` is intentionally unused — the default executor does not
+      // cancel sdk.session.prompt today (W-26 / FOLLOW-UP-1). `resumeSessionId`
+      // resumes a chat's durable session (SDD-01); `overrideModel` is the chat
+      // model override (SDD-02), taking precedence over persona frontmatter.
+      async execute(prompt, persona, _signal, onSessionCreated, resumeSessionId, _chatId, overrideModel): Promise<HeadlessRunResult> {
         const start = Date.now()
         const { Server } = await import("../server/server")
         const { createOpencodeClient } = await import("@opencode-ai/sdk/v2")
@@ -70,14 +126,33 @@ export namespace Runner {
 
             const sdk = createOpencodeClient({ baseUrl: "http://foxybear.internal", fetch: fetchFn })
 
-            const title = prompt.slice(0, 50) + (prompt.length > 50 ? "..." : "")
-            const created = await sdk.session.create({ title })
-            const sessionID = created.data?.id
-            if (!sessionID) {
-              throw new Error("Failed to create session")
+            // SDD-04 SC-2: resume the chat's durable session when one was supplied
+            // and still exists (probe via session.messages); otherwise create a
+            // fresh session and fire onSessionCreated. onSessionCreated fires ONLY
+            // on creation, never on resume, so the worker's write-back is skipped
+            // for resumed sessions (W-12a).
+            let sessionID: string | undefined
+            if (resumeSessionId) {
+              try {
+                await sdk.session.messages({ sessionID: resumeSessionId } as any)
+                sessionID = resumeSessionId
+              } catch (err) {
+                log.info("resume session missing, creating new", {
+                  sessionID: resumeSessionId,
+                  error: String(err),
+                })
+              }
             }
 
-            onSessionCreated?.(sessionID)
+            if (!sessionID) {
+              const title = prompt.slice(0, 50) + (prompt.length > 50 ? "..." : "")
+              const created = await sdk.session.create({ title })
+              sessionID = created.data?.id
+              if (!sessionID) {
+                throw new Error("Failed to create session")
+              }
+              onSessionCreated?.(sessionID)
+            }
 
             if (resolvedPersona) {
               PersonaSession.attach(sessionID as SessionID, resolvedPersona)
@@ -88,7 +163,20 @@ export namespace Runner {
             }
 
             try {
-              const model = resolvedPersona?.model ? Provider.parseModel(resolvedPersona.model) : undefined
+              // SEC-1 choke point (SDD-02): resolve the effective model with
+              // precedence override > frontmatter > default, and assert it is
+              // allowed BEFORE sdk.session.prompt. For a policy-bearing persona a
+              // denied model from ANY path throws here and the prompt is never
+              // sent. `Provider.defaultModel()` supplies the concrete fallback so
+              // no denied default can slip through as `undefined`.
+              const model = await resolveEffectiveModel(resolvedPersona, overrideModel, () =>
+                AppRuntime.runPromise(
+                  Effect.gen(function* () {
+                    const svc = yield* Provider.Service
+                    return yield* svc.defaultModel()
+                  }),
+                ),
+              )
               const response = await sdk.session.prompt({
                 sessionID,
                 parts: [{ type: "text", text: prompt }],

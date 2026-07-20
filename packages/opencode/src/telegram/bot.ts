@@ -9,11 +9,14 @@ import {
 } from "./api"
 import { HarnessCommands } from "../harness/commands"
 import { TelegramStore } from "./store"
+import { TelegramCorrelation } from "./correlation"
 import { PersonaPolicy } from "../persona/policy"
 import { Queue } from "../queue/queue"
 import { JobWorker } from "../queue/worker"
 import { Log } from "../util/log"
+import { QuestionID } from "../question/schema"
 import type { PersonaConfig } from "../persona/index"
+import type { Question } from "../question"
 
 const log = Log.create({ service: "telegram" })
 
@@ -53,6 +56,9 @@ interface PendingQuestion {
   totalQuestions: number
   answers: (string | undefined)[]
   telegramMessageIds: number[]
+  // SDD-03 QR-2/QR-5: carry the request's questions so option labels and
+  // follow-up questions come from this in-memory entry, not a global registry.
+  questions: Question.Info[]
 }
 
 const QUESTION_PREFIX = "q:"
@@ -83,9 +89,10 @@ export namespace TelegramBot {
   let _offset: number | undefined
   let _chatStates = new Map<string, ChatState>()
   let _pollAbort: AbortController | null = null
-  let _sessionToChat = new Map<string, string>()
   let _pendingQuestions = new Map<string, PendingQuestion>()
-  let _questionPollTimer: ReturnType<typeof setInterval> | null = null
+  // SDD-03 QR-1: the inbound half of the question bridge is a single Bus
+  // subscription, not a poller. This holds its unsubscribe handle.
+  let _questionUnsub: (() => void) | null = null
   let _deliveryTimer: ReturnType<typeof setInterval> | null = null
   let _lastProgressEdit = new Map<string, number>()
 
@@ -120,10 +127,10 @@ export namespace TelegramBot {
       deliveryPass().catch((err) => log.warn("telegram: delivery pass error", { error: String(err) }))
     })
 
-    // Start long-polling + delivery + question relay in background
+    // Start long-polling + delivery in background, and wire the question bridge.
     pollLoop()
     startDeliveryLoop()
-    startQuestionPoller()
+    await startQuestionBridge()
   }
 
   export async function stop(): Promise<void> {
@@ -131,9 +138,9 @@ export namespace TelegramBot {
     _pollAbort?.abort()
     _pollAbort = null
     _botInfo = null
-    if (_questionPollTimer) {
-      clearInterval(_questionPollTimer)
-      _questionPollTimer = null
+    if (_questionUnsub) {
+      _questionUnsub()
+      _questionUnsub = null
     }
     if (_deliveryTimer) {
       clearInterval(_deliveryTimer)
@@ -635,37 +642,61 @@ export namespace TelegramBot {
     return _chatStates.get(chatId)!
   }
 
-  function startQuestionPoller(): void {
-    _questionPollTimer = setInterval(async () => {
-      if (!_running) return
-      try {
-        await pollPendingQuestions()
-      } catch (err) {
-        log.warn("telegram: question poll error", { error: String(err) })
-      }
-    }, 2000)
+  // SDD-03 QR-1/QR-13/SC-5: the inbound half of the question bridge. Exactly one
+  // Bus.subscribe(Question.Event.Asked) registered inside the directory-scoped
+  // Instance context, so it attaches to the same instance-keyed Bus PubSub the
+  // `question` tool publishes on (process.cwd()). No timer, no Layer B poll.
+  async function startQuestionBridge(): Promise<void> {
+    const { Bus } = await import("../bus")
+    const { Question } = await import("../question")
+    const { Instance } = await import("../project/instance")
+    const { InstanceBootstrap } = await import("../project/bootstrap")
+    const { AppRuntime } = await import("../effect/app-runtime")
+
+    _questionUnsub = await Instance.provide({
+      directory: process.cwd(),
+      init: () => AppRuntime.runPromise(InstanceBootstrap),
+      fn: () =>
+        Bus.subscribe(Question.Event.Asked, (evt) => {
+          handleAsked(evt.properties).catch((err) =>
+            log.warn("telegram: question bridge handler error", { error: String(err) }),
+          )
+        }),
+    })
+    log.info("telegram: question bridge subscribed")
   }
 
-  async function pollPendingQuestions(): Promise<void> {
-    const { Question } = await import("../question")
-    const questions = Question.globalList()
-    if (questions.length === 0) return
+  // SDD-03 QR-2/QR-4/QR-5: resolve the originating chat for the question's
+  // session via durable, parent-walk correlation (QR-3). If no chat-owning
+  // ancestor exists (scheduler/mesh origin), log and return — the question stays
+  // parked on its Layer A Deferred and resolves via its own timeout, no throw
+  // (QR-4). Otherwise seed the in-memory progression entry and deliver only the
+  // first question; later questions follow one at a time (QR-5).
+  async function handleAsked(req: Question.Request): Promise<void> {
+    const qid = String(req.id)
+    if (_pendingQuestions.has(qid)) return
 
-    for (const q of questions) {
-      const qid = String(q.id)
-      if (_pendingQuestions.has(qid)) continue
-      // Resolve chat from the in-heap cache, falling back to the durable
-      // correlation the worker persisted (TelegramStore). SDD-03 rewires this.
-      const chatId = _sessionToChat.get(String(q.sessionID)) ?? TelegramStore.getBySession(String(q.sessionID))?.chat_id
-      if (!chatId) continue
-
-      const totalQ = q.questions.length
-      log.info("telegram: relaying question to chat", { questionId: qid, chatId, totalQuestions: totalQ })
-      _pendingQuestions.set(qid, { chatId, totalQuestions: totalQ, answers: new Array(totalQ).fill(undefined), telegramMessageIds: [] })
-
-      // Send only the first question — subsequent ones are sent after each answer
-      await sendQuestionKeyboard(qid, q.questions[0], 0, chatId)
+    const chatId = TelegramCorrelation.resolveChatForSession(String(req.sessionID))
+    if (!chatId) {
+      log.info("telegram: question has no chat-owning session; not relaying", {
+        questionId: qid,
+        sessionId: req.sessionID,
+      })
+      return
     }
+
+    const totalQ = req.questions.length
+    log.info("telegram: relaying question to chat", { questionId: qid, chatId, totalQuestions: totalQ })
+    _pendingQuestions.set(qid, {
+      chatId,
+      totalQuestions: totalQ,
+      answers: new Array(totalQ).fill(undefined),
+      telegramMessageIds: [],
+      questions: req.questions,
+    })
+
+    // Send only the first question — subsequent ones are sent after each answer.
+    await sendQuestionKeyboard(qid, req.questions[0], 0, chatId)
   }
 
   async function handleCallbackQuery(cbq: any): Promise<void> {
@@ -685,16 +716,15 @@ export namespace TelegramBot {
       const qi = parseInt(qiStr, 10)
       const oi = parseInt(oiStr, 10)
 
+      // QR-8: an unknown/expired requestID (e.g. lost to restart) has no entry.
+      // The callback was already acknowledged above; just return, no throw.
       const pending = _pendingQuestions.get(requestId)
       if (!pending) return
 
-      const { Question } = await import("../question")
-      const questions = Question.globalList()
-      const q = questions.find((x: any) => x.id === requestId)
-      if (!q || !q.questions[qi]?.options[oi]) return
+      const option = pending.questions[qi]?.options[oi]
+      if (!option) return
 
-      const label = q.questions[qi].options[oi].label
-      await submitQuestionAnswer(requestId, qi, label, chatId)
+      await submitQuestionAnswer(requestId, qi, option.label, chatId)
     } else if (data.startsWith(CUSTOM_PREFIX)) {
       const parts = data.slice(CUSTOM_PREFIX.length).split(":")
       const [requestId, qiStr] = parts
@@ -755,27 +785,38 @@ export namespace TelegramBot {
     await sendMessage(_config.bot_token!, chatId, `✓ ${answer}`)
     pending.answers[questionIndex] = answer
 
-    // Check if all questions are answered
+    // Check if all questions are answered — send the next one from the entry
+    // (QR-5), never a global registry.
     const nextUnanswered = pending.answers.findIndex((a) => a === undefined)
     if (nextUnanswered >= 0) {
-      const { Question } = await import("../question")
-      const allQuestions = Question.globalList()
-      const q = allQuestions.find((x: any) => x.id === requestId)
-      if (q?.questions[nextUnanswered]) {
-        await sendQuestionKeyboard(requestId, q.questions[nextUnanswered], nextUnanswered, chatId)
+      const nextQuestion = pending.questions[nextUnanswered]
+      if (nextQuestion) {
+        await sendQuestionKeyboard(requestId, nextQuestion, nextUnanswered, chatId)
       }
       return
     }
 
-    // All answered — submit via global registry (resolves the Effect deferred directly)
+    // All answered — succeed the parked Layer A Deferred through the
+    // instance-scoped reply path (QR-7/QR-13/SC-5). Question.Service state is
+    // keyed by directory, so this MUST run inside Instance.provide({ directory:
+    // process.cwd() }): a bare AppRuntime.runPromise(Question.Service.use(...))
+    // carries no instance ALS context, throws LocalContext.NotFound, and never
+    // resolves the Deferred. A reply for an already-gone request logs a warning
+    // and returns void inside the service (QR-8) — it does NOT throw here.
     try {
       const answers = pending.answers.map((a) => [a!])
       const { Question } = await import("../question")
-      const ok = Question.globalReply(requestId as any, answers)
-      if (!ok) {
-        log.warn("telegram: question no longer pending", { requestId })
-        await sendMessage(_config.bot_token!, chatId, "Question expired.")
-      }
+      const { Instance } = await import("../project/instance")
+      const { InstanceBootstrap } = await import("../project/bootstrap")
+      const { AppRuntime } = await import("../effect/app-runtime")
+      await Instance.provide({
+        directory: process.cwd(),
+        init: () => AppRuntime.runPromise(InstanceBootstrap),
+        fn: () =>
+          AppRuntime.runPromise(
+            Question.Service.use((svc) => svc.reply({ requestID: QuestionID.make(requestId), answers })),
+          ),
+      })
       _pendingQuestions.delete(requestId)
       log.info("telegram: all questions answered", { requestId, answers: pending.answers })
     } catch (err) {
@@ -792,12 +833,11 @@ export namespace TelegramBot {
     _botInfo = null
     _offset = undefined
     _chatStates = new Map()
-    _sessionToChat = new Map()
     _pendingQuestions = new Map()
     _lastProgressEdit = new Map()
-    if (_questionPollTimer) {
-      clearInterval(_questionPollTimer)
-      _questionPollTimer = null
+    if (_questionUnsub) {
+      _questionUnsub()
+      _questionUnsub = null
     }
     if (_deliveryTimer) {
       clearInterval(_deliveryTimer)

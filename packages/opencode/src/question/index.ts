@@ -198,39 +198,4 @@ export namespace Question {
   )
 
   export const defaultLayer = layer.pipe(Layer.provide(Bus.layer))
-
-  const _globalPending = new Map<QuestionID, Request>()
-  const _globalDeferreds = new Map<QuestionID, { resolve: (answers: Answer[]) => void }>()
-
-  export function globalRegister(req: Request, resolve: (answers: Answer[]) => void): void {
-    _globalPending.set(req.id, req)
-    _globalDeferreds.set(req.id, { resolve })
-  }
-
-  export function globalUnregister(id: QuestionID): void {
-    _globalPending.delete(id)
-    _globalDeferreds.delete(id)
-  }
-
-  export function globalList(): Request[] {
-    return Array.from(_globalPending.values())
-  }
-
-  export function globalReply(requestId: QuestionID, answers: Answer[]): boolean {
-    const entry = _globalDeferreds.get(requestId)
-    if (!entry) return false
-    entry.resolve(answers)
-    _globalPending.delete(requestId)
-    _globalDeferreds.delete(requestId)
-    return true
-  }
-
-  export function globalReject(requestId: QuestionID): boolean {
-    const entry = _globalDeferreds.get(requestId)
-    if (!entry) return false
-    entry.resolve([])
-    _globalPending.delete(requestId)
-    _globalDeferreds.delete(requestId)
-    return true
-  }
 }

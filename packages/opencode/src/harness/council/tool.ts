@@ -82,12 +82,14 @@ export const CouncilTool = Tool.define(
           }
         }
 
+        // Don't pass the session abort signal to council fetches: it fires
+        // when the Effect scope closes, which happens while long-running tool
+        // executions are still in flight. Each API call has its own 180s timeout.
         const runner: SubAgentRunner = {
           async run(model, systemPrompt, userPrompt) {
-            if (ctx.abort.aborted) throw new Error("Council cancelled")
-            await Effect.runPromise(ctx.metadata({ title: `Council: ${model.name} responding...` }))
+            await Effect.runPromise(ctx.metadata({ title: `Council: ${model.name} responding...` })).catch(() => {})
             const apiKey = keyCache.get(model.provider)!
-            return callModel(model, apiKey, systemPrompt, userPrompt, ctx.abort)
+            return callModel(model, apiKey, systemPrompt, userPrompt)
           },
         }
 
